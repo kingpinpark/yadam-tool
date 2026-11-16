@@ -1,19 +1,17 @@
-import os, re, io, wave, time, json, zipfile, textwrap, tempfile, requests
-import numpy as np
+import os, re, io, wave, time, json, asyncio, zipfile, tempfile, requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+import edge_tts
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from openai import OpenAI
 from anthropic import Anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
-from moviepy.editor import VideoClip, AudioFileClip, concatenate_videoclips
 
 st.set_page_config(page_title="야담 스튜디오", layout="wide")
-st.title("📜 멀티 AI 초장편 야담 스튜디오 (초고속 엔진)")
+st.title("📜 멀티 AI 초장편 야담 스튜디오 (무한로딩 방지 엔진)")
 
-for k, v in [("analysis", ""), ("scenes_data", None), ("media", {}), ("mp4", None), ("ch", 1), ("hist", [])]:
+for k, v in [("analysis", ""), ("scenes_data", None), ("media", {}), ("ch", 1), ("hist", [])]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -24,7 +22,7 @@ def clean_k(k):
 # --- 사이드바 설정 ---
 with st.sidebar:
     st.header("1. AI 엔진 연결")
-    g_key = clean_k(st.text_input("Gemini API 키 (올인원)", type="password"))
+    g_key = clean_k(st.text_input("Gemini API 키", type="password"))
     st.caption("[Gemini 키 발급](https://aistudio.google.com/app/apikey)")
     o_key = clean_k(st.text_input("OpenAI API 키 (선택)", type="password"))
     c_key = clean_k(st.text_input("Claude API 키 (선택)", type="password"))
@@ -38,14 +36,21 @@ with st.sidebar:
     st.divider()
     analyst_ai = st.selectbox("1단계 [분석가 AI]", ais, index=0)
     writer_ai = st.selectbox("2단계 [작가 AI]", ais, index=0)
-    m_eng = st.selectbox("3단계 [삽화/성우]", ["Gemini 올인원", "OpenAI"] if o_key else ["Gemini 올인원"])
-    v_list = ["Charon", "Fenrir", "Puck", "Aoede", "Kore"] if "Gemini" in m_eng else ["onyx", "echo", "fable"]
-    tts_voice = st.selectbox("성우 목소리", v_list)
+    img_eng = st.selectbox("3단계 [삽화 엔진]", ["Gemini (Imagen 3)", "OpenAI (DALL-E 3)"] if o_key else ["Gemini (Imagen 3)"])
+    tts_eng = st.selectbox("3단계 [성우 엔진]", ["초고속 한국어 성우 (1초 생성/멈춤 없음)", "Gemini 성우", "OpenAI 성우"])
+
+    if "초고속" in tts_eng:
+        tts_voice = st.selectbox("목소리 선택", ["ko-KR-InJoonNeural (중후한 남성)", "ko-KR-BongJinNeural (차분한 남성)", "ko-KR-SunHiNeural (단아한 여성)"])
+    elif "Gemini" in tts_eng:
+        tts_voice = st.selectbox("목소리 선택", ["Charon", "Fenrir", "Puck", "Aoede", "Kore"])
+    else:
+        tts_voice = st.selectbox("목소리 선택", ["onyx", "echo", "fable"])
+
     def_st = "Traditional Korean folk painting, Joseon Dynasty illustration, ink wash and watercolor --"
     style_anchor = st.text_area("고정 화풍", def_st, height=68)
 
 # =========================================================
-# [1단계 UI] 유튜브 링크 입력창 (최상단 고정 배치!)
+# [1단계 UI] 유튜브 링크 입력창
 # =========================================================
 st.subheader("1단계: 벤치마킹 유튜브 영상 분석")
 fast_opt = st.checkbox("⚡ 초고속 핵심 구간 분석 (도입+중반+결말 추출로 3~5초 완료)", value=True)
@@ -60,7 +65,6 @@ with st.expander("📝 대본/자막 직접 붙여넣기 (유튜브 IP 차단 �
     m_txt = st.text_area("유튜브 [스크립트 표시] 전체 내용을 붙여넣으세요", height=120)
     btn_txt_analyze = st.button("붙여넣은 대본 분석")
 
-# --- 핵심 동작 함수 ---
 class Scene(BaseModel):
     scene_number: int
     narration: str
@@ -71,11 +75,15 @@ class YadamScript(BaseModel):
     chapter_summary: str
     scenes: list[Scene]
 
+def get_gclient(timeout_sec=35):
+    if not g_key: raise ValueError("왼쪽 사이드바에 Gemini API 키를 입력해 주세요.")
+    # 무한 대기 방지를 위해 타임아웃(밀리초) 강제 설정
+    return genai.Client(api_key=g_key, http_options=types.HttpOptions(timeout=timeout_sec * 1000))
+
 def call_ai(label, prompt, is_json=False, fast=False):
     jh = '\nJSON만 출력: {"title":"","chapter_summary":"","scenes":[{"scene_number":1,"narration":"","image_prompt":""}]}'
     if label.startswith("Gemini"):
-        if not g_key: raise ValueError("왼쪽 사이드바에 Gemini API 키를 입력해 주세요.")
-        client = genai.Client(api_key=g_key)
+        client = get_gclient(45)
         model = label.split("(")[1][:-1]
         kw = {"response_mime_type": "application/json", "response_schema": YadamScript} if is_json else {}
         if fast and "flash" in model:
@@ -83,12 +91,12 @@ def call_ai(label, prompt, is_json=False, fast=False):
         cfg = types.GenerateContentConfig(**kw) if kw else None
         return client.models.generate_content(model=model, contents=prompt, config=cfg).text
     elif label.startswith("OpenAI"):
-        client = OpenAI(api_key=o_key)
+        client = OpenAI(api_key=o_key, timeout=45.0)
         p = prompt + jh if is_json else prompt
         kw = {"response_format": {"type": "json_object"}} if is_json else {}
         return client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": p}], **kw).choices[0].message.content
     elif label.startswith("Claude"):
-        client = Anthropic(api_key=c_key)
+        client = Anthropic(api_key=c_key, timeout=45.0)
         p = prompt + jh if is_json else prompt
         t = client.messages.create(model="claude-sonnet-4-6", max_tokens=8192, messages=[{"role": "user", "content": p}]).content[0].text
         return re.sub(r"^```json\s*|\s*```$", "", t.strip(), flags=re.M).strip() if is_json else t
@@ -115,7 +123,7 @@ def run_analyze(txt):
 if btn_url_analyze:
     try:
         t0 = time.time()
-        with st.spinner("유튜브 자막 추출 및 초고속 분석 중..."):
+        with st.spinner("초고속 분석 중..."):
             st.session_state.analysis = run_analyze(get_yt(yt_url))
             st.success(f"분석 완료! ({time.time()-t0:.1f}초)")
     except Exception as e: st.error(str(e))
@@ -139,7 +147,7 @@ st.divider()
 st.subheader("2단계: 대장편 야담 챕터별 대본 집필")
 c_t, c_n, c_l = st.columns([3, 1, 2])
 topic = c_t.text_input("야담 대주제 입력", placeholder="예: 산속 폐가에서 만난 여인의 비밀")
-sc_cnt = c_n.number_input("장면 수", 4, 25, 8)
+sc_cnt = c_n.number_input("장면 수", 4, 25, 6)
 l_mode = c_l.selectbox("분량", ["중편 (4~5문장)", "초장편 (7~10문장)", "단편 (2~3문장)"])
 
 b1, b2 = st.columns(2)
@@ -153,37 +161,51 @@ if (s_new or c_nxt) and topic:
         st.session_state.hist.append(f"[{st.session_state.ch}부]: {st.session_state.scenes_data.get('chapter_summary','')}")
         st.session_state.ch += 1
     ch = st.session_state.ch
-    with st.spinner(f"[{ch}부] 대본 집필 중..."):
+    with st.spinner(f"[{ch}부] 대본 집필 중 (약 5~15초)..."):
         try:
             gp = f"조선시대 전기수 말투('~했더랍니다')로 '{topic}' 제 {ch}부를 {sc_cnt}개 장면({l_mode})으로 작성하세요. chapter_summary는 3줄 요약, image_prompt는 영문 묘사.\n이전줄거리:{st.session_state.hist}\n공식:{st.session_state.analysis}"
-            st.session_state.scenes_data = json.loads(call_ai(writer_ai, gp, is_json=True))
-            st.session_state.media, st.session_state.mp4 = {}, None
+            st.session_state.scenes_data = json.loads(call_ai(writer_ai, gp, is_json=True, fast=True))
+            st.session_state.media = {}
             st.rerun()
         except Exception as e: st.error(f"대본 오류: {e}")
 
 # =========================================================
-# [3~4단계 UI] 삽화·성우 생성 및 ZIP/MP4 다운로드
+# [3~4단계 UI] 무한 대기 없는 삽화·성우 생성 및 ZIP 다운로드
 # =========================================================
 def gen_img(p):
-    if "Gemini" in m_eng:
-        client = genai.Client(api_key=g_key)
+    if "Gemini" in img_eng:
+        client = get_gclient(25)  # 25초 초과 시 즉시 중단
         cfg = types.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9", output_mime_type="image/png")
-        return client.models.generate_images(model="imagen-3.0-generate-002", prompt=p, config=cfg).generated_images[0].image.image_bytes
-    u = OpenAI(api_key=o_key).images.generate(model="dall-e-3", prompt=p, size="1792x1024", n=1).data[0].url
-    return requests.get(u, timeout=30).content
+        for m_name in ["imagen-3.0-generate-002", "imagen-3.0-fast-generate-001"]:
+            try:
+                res = client.models.generate_images(model=m_name, prompt=p, config=cfg)
+                return res.generated_images[0].image.image_bytes
+            except Exception as e:
+                last_e = e
+        raise RuntimeError(f"Imagen 생성 실패 (결제 계정이 연결된 API 키인지 확인하세요): {last_e}")
+    u = OpenAI(api_key=o_key, timeout=25.0).images.generate(model="dall-e-3", prompt=p, size="1792x1024", n=1).data[0].url
+    return requests.get(u, timeout=20).content
 
 def gen_aud(txt):
-    if "Gemini" in m_eng:
-        client = genai.Client(api_key=g_key)
+    if "초고속" in tts_eng:
+        v_id = tts_voice.split(" ")[0]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.close()
+        asyncio.run(edge_tts.Communicate(txt, v_id, rate="-5%").save(tmp.name))
+        data = open(tmp.name, "rb").read()
+        os.remove(tmp.name)
+        return data, "mp3"
+    elif "Gemini" in tts_eng:
+        client = get_gclient(25)
         vc = types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=tts_voice))
         cfg = types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=types.SpeechConfig(voice_config=vc))
-        res = client.models.generate_content(model="gemini-3.8-flash", contents=f"조선시대 이야기꾼처럼 차분히 읽어주세요:\n{txt}", config=cfg)
+        res = client.models.generate_content(model="gemini-2.5-flash-preview-tts", contents=txt, config=cfg)
         pcm = res.candidates[0].content.parts[0].inline_data.data
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(24000); wf.writeframes(pcm)
         return buf.getvalue(), "wav"
-    return OpenAI(api_key=o_key).audio.speech.create(model="tts-1", voice=tts_voice, input=txt).content, "mp3"
+    return OpenAI(api_key=o_key, timeout=25.0).audio.speech.create(model="tts-1", voice=tts_voice, input=txt).content, "mp3"
 
 if st.session_state.scenes_data:
     d, ch = st.session_state.scenes_data, st.session_state.ch
@@ -194,29 +216,53 @@ if st.session_state.scenes_data:
         n = sc["scene_number"]
         with st.container(border=True):
             t1, t2 = st.columns(2)
-            nar = t1.text_area(f"장면 {n} 대본", sc["narration"], key=f"n_{ch}_{n}", height=100)
-            imp = t2.text_area(f"장면 {n} 프롬프트", f"{style_anchor} {sc['image_prompt']}", key=f"i_{ch}_{n}", height=100)
+            nar = t1.text_area(f"장면 {n} 대본", sc["narration"], key=f"n_{ch}_{n}", height=95)
+            imp = t2.text_area(f"장면 {n} 프롬프트", f"{style_anchor} {sc['image_prompt']}", key=f"i_{ch}_{n}", height=95)
             edited.append({"scene_number": n, "narration": nar, "prompt": imp})
-            m = st.session_state.media.get(n, {})
-            if "img" in m: t1.image(m["img"], use_container_width=True)
-            if "aud" in m: t2.audio(m["aud"], format=f"audio/{m.get('ext','wav')}")
 
-    if st.button(f"⚡ [{ch}부] 모든 장면 삽화 + 성우 한 번에 생성", type="primary", use_container_width=True):
+            b_aud, b_img = t1.button(f"🎙️ 장면 {n} 성우만 생성", key=f"ba_{ch}_{n}"), t2.button(f"🎨 장면 {n} 삽화만 생성", key=f"bi_{ch}_{n}")
+            if b_aud:
+                with st.spinner("성우 녹음 중 (1~5초)..."):
+                    try:
+                        ab, ext = gen_aud(nar)
+                        st.session_state.media.setdefault(n, {}).update({"aud": ab, "ext": ext})
+                    except Exception as e: st.error(f"성우 오류: {e}")
+            if b_img:
+                with st.spinner("삽화 그리는 중 (5~15초)..."):
+                    try:
+                        st.session_state.media.setdefault(n, {})["img"] = gen_img(imp)
+                    except Exception as e: st.error(f"삽화 오류: {e}")
+
+            m = st.session_state.media.get(n, {})
+            if "aud" in m: t1.audio(m["aud"], format=f"audio/{m.get('ext','mp3')}")
+            if "img" in m: t2.image(m["img"], use_container_width=True)
+
+    if st.button(f"⚡ [{ch}부] 모든 장면 삽화 + 성우 한 번에 생성 (타임아웃 보호)", type="primary", use_container_width=True):
         pb = st.progress(0)
+        status = st.empty()
         for idx, sc in enumerate(edited):
             n = sc["scene_number"]
-            pb.progress(idx / len(edited), text=f"장면 {n} 생성 중...")
-            if "img" not in st.session_state.media.get(n, {}):
-                st.session_state.media.setdefault(n, {})["img"] = gen_img(sc["prompt"])
             if "aud" not in st.session_state.media.get(n, {}):
-                ab, ext = gen_aud(sc["narration"])
-                st.session_state.media.setdefault(n, {}).update({"aud": ab, "ext": ext})
-        pb.progress(1.0, text="생성 완료!"); st.rerun()
+                status.info(f"🎙️ 장면 {n}/{len(edited)} 성우 녹음 중...")
+                try:
+                    ab, ext = gen_aud(sc["narration"])
+                    st.session_state.media.setdefault(n, {}).update({"aud": ab, "ext": ext})
+                except Exception as e:
+                    st.warning(f"장면 {n} 성우 건너뜀: {e}")
+            if "img" not in st.session_state.media.get(n, {}):
+                status.info(f"🎨 장면 {n}/{len(edited)} 삽화 그리는 중 (최대 25초)...")
+                try:
+                    st.session_state.media.setdefault(n, {})["img"] = gen_img(sc["prompt"])
+                except Exception as e:
+                    st.warning(f"장면 {n} 삽화 건너뜀: {e}")
+            pb.progress((idx + 1) / len(edited))
+        status.success("✅ 작업이 끝났습니다!")
+        st.rerun()
 
     z_buf = io.BytesIO()
     with zipfile.ZipFile(z_buf, "w") as zf:
         for sc in edited:
             n, m = sc["scene_number"], st.session_state.media.get(sc["scene_number"], {})
             if "img" in m: zf.writestr(f"part{ch}_{n:02d}.png", m["img"])
-            if "aud" in m: zf.writestr(f"part{ch}_{n:02d}.{m.get('ext','wav')}", m["aud"])
+            if "aud" in m: zf.writestr(f"part{ch}_{n:02d}.{m.get('ext','mp3')}", m["aud"])
     st.download_button(f"📥 [{ch}부] 캡컷/브루용 전체 소스 ZIP 다운로드", z_buf.getvalue(), f"yadam_part{ch}.zip", "application/zip", use_container_width=True)
