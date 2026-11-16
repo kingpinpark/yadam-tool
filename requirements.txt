@@ -4,3 +4,7 @@ openai
 anthropic
 youtube-transcript-api
 pydantic
+moviepy==1.0.3
+pillow
+numpy
+requests
