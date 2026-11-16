@@ -1,19 +1,25 @@
+import os
 import re
 import time
 import json
-import base64
+import textwrap
+import tempfile
+import requests
+import numpy as np
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from openai import OpenAI
 from anthropic import Anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
+from moviepy.editor import VideoClip, AudioFileClip, concatenate_videoclips
 
 # 1. 웹 페이지 기본 설정
 st.set_page_config(page_title="멀티 AI 야담·민담 스튜디오", page_icon="📜", layout="wide")
-st.title("📜 멀티 AI 협력형 야담·민담 제작 스튜디오")
-st.caption("분석가(Gemini) · 작가(Claude / GPT) · 화가·성우(OpenAI)가 각자 잘하는 일을 분담해 영상을 기획합니다.")
+st.title("📜 멀티 AI 야담·민담 올인원 제작 스튜디오")
+st.caption("영상 분석 ➔ 대본 집필 ➔ 삽화·성우 생성 ➔ 줌인 효과 & 자막 MP4 영상 완성까지 한 번에 처리합니다.")
 
 # Gemini 사용 가능 모델 자동 조회
 @st.cache_data(ttl=600)
@@ -30,16 +36,26 @@ def get_available_gemini_models(key: str):
     except Exception:
         return ["gemini-3.8-flash"]
 
+# 한글 자막용 폰트 자동 준비 (웹서버/PC 환경 모두 한글 깨짐 방지)
+@st.cache_resource
+def get_korean_font_path():
+    font_path = os.path.join(tempfile.gettempdir(), "NanumGothicBold.ttf")
+    if not os.path.exists(font_path):
+        url = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Bold.ttf"
+        res = requests.get(url, timeout=15)
+        with open(font_path, "wb") as f:
+            f.write(res.content)
+    return font_path
+
 # ==========================================
-# 사이드바: 여러 AI API 키 연결 및 역할 분담
+# 사이드바: 여러 AI API 키 연결 및 설정
 # ==========================================
 with st.sidebar:
-    st.header("🔑 1. AI 엔진 연결 (필요한 것만 입력)")
+    st.header("🔑 1. AI 엔진 연결")
     gemini_key = st.text_input("Gemini API 키 (Google)", type="password", placeholder="AIzaSy...")
     openai_key = st.text_input("OpenAI API 키 (GPT / 삽화 / 성우)", type="password", placeholder="sk-...")
     claude_key = st.text_input("Claude API 키 (Anthropic)", type="password", placeholder="sk-ant-...")
     
-    # 연결된 AI 목록 구성
     connected_ais = []
     if gemini_key:
         for gm in get_available_gemini_models(gemini_key)[:4]:
@@ -58,25 +74,30 @@ with st.sidebar:
         connected_ais = ["사이드바에 API 키를 1개 이상 입력하세요"]
 
     st.divider()
-    st.header("🤝 2. AI 역할 분담 설정")
-    analyst_ai = st.selectbox("🔍 1단계 [영상 분석가] 담당 AI", options=connected_ais, index=0)
+    st.header("🤝 2. AI 역할 분담")
+    analyst_ai = st.selectbox("🔍 1단계 [영상 분석가] AI", options=connected_ais, index=0)
     writer_ai = st.selectbox(
-        "✍️ 2단계 [야담 작가] 담당 AI",
+        "✍️ 2단계 [야담 작가] AI",
         options=connected_ais,
         index=min(1, len(connected_ais) - 1)
     )
-    st.caption("💡 팁: 분석은 빠르고 긴 글에 강한 Gemini에게, 대본 집필은 문장력이 좋은 Claude나 GPT에게 맡겨보세요!")
 
     st.divider()
-    st.subheader("🎨 고정 화풍 설정 (Style Anchor)")
+    st.subheader("🎙️ 성우 목소리 & 화풍 설정")
+    tts_voice = st.selectbox(
+        "성우 목소리 톤 (OpenAI TTS)",
+        options=["onyx", "echo", "fable", "alloy", "nova", "shimmer"],
+        index=0,
+        help="onyx: 중후하고 차분한 남성 내레이션 추천 / fable: 이야기꾼 톤"
+    )
     style_anchor = st.text_area(
-        "모든 장면 그림 프롬프트 앞에 자동 결합됩니다.",
+        "고정 화풍 태그 (Style Anchor)",
         value="Traditional Korean folk painting style, Joseon Dynasty historical illustration, moody cinematic lighting, ink wash and soft watercolor texture --",
         height=90
     )
 
 # ==========================================
-# 통합 AI 호출 엔진 (Gemini / OpenAI / Claude 공용)
+# 통합 AI 호출 엔진
 # ==========================================
 class Scene(BaseModel):
     scene_number: int = Field(description="장면 번호 (1부터 순차 증가)")
@@ -147,7 +168,6 @@ def call_selected_ai(ai_label: str, prompt: str, is_json: bool = False) -> str:
                 temperature=0.8
             )
             text = res.content[0].text.strip()
-            # 마크다운 코드블록(```json ... ```) 제거 처리
             text = re.sub(r"^```json\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
             return text
         else:
@@ -178,6 +198,123 @@ def fetch_youtube_transcript(video_id: str) -> str:
     except Exception as e:
         raise RuntimeError(f"자막을 가져오지 못했습니다: {e}")
 
+# ==========================================
+# MP4 동영상 렌더링 엔진 (줌인 효과 + 한글 자막)
+# ==========================================
+def create_subtitle_overlay(width: int, height: int, text: str, font_path: str) -> Image.Image:
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font_size = max(26, int(height * 0.042))
+    font = ImageFont.truetype(font_path, font_size)
+
+    # 긴 대사를 화면 폭에 맞게 2~3줄로 자동 줄바꿈
+    wrapped_lines = textwrap.wrap(text.strip(), width=34)
+    if not wrapped_lines:
+        return overlay
+
+    line_heights = []
+    line_widths = []
+    for line in wrapped_lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_widths.append(bbox[2] - bbox[0])
+        line_heights.append(bbox[3] - bbox[1])
+
+    padding_x = 32
+    padding_y = 18
+    line_spacing = 10
+    total_text_h = sum(line_heights) + line_spacing * (len(wrapped_lines) - 1)
+    max_text_w = max(line_widths)
+
+    box_w = min(width - 80, max_text_w + padding_x * 2)
+    box_h = total_text_h + padding_y * 2
+    box_x0 = (width - box_w) // 2
+    box_y0 = height - box_h - int(height * 0.06)
+    box_x1 = box_x0 + box_w
+    box_y1 = box_y0 + box_h
+
+    # 반투명 어두운 자막 배경 박스
+    draw.rounded_rectangle([box_x0, box_y0, box_x1, box_y1], radius=14, fill=(10, 10, 15, 185))
+
+    # 텍스트 그리기 (외곽선 + 흰색 글씨)
+    curr_y = box_y0 + padding_y
+    for idx, line in enumerate(wrapped_lines):
+        tx = (width - line_widths[idx]) // 2
+        draw.text((tx, curr_y), line, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+        curr_y += line_heights[idx] + line_spacing
+
+    return overlay
+
+def build_final_mp4(edited_scenes: list, scene_media: dict, font_path: str) -> str:
+    W, H = 1280, 720  # 16:9 HD 해상도 (빠르고 안정적인 웹 렌더링)
+    clips = []
+    temp_files = []
+
+    try:
+        for sc in edited_scenes:
+            s_num = sc["scene_number"]
+            media = scene_media.get(s_num, {})
+            if "image_bytes" not in media or "audio_bytes" not in media:
+                raise ValueError(f"장면 {s_num}의 삽화 또는 성우 음성이 아직 생성되지 않았습니다.")
+
+            # 임시 파일에 이미지와 오디오 저장
+            img_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            img_tmp.write(media["image_bytes"])
+            img_tmp.close()
+            temp_files.append(img_tmp.name)
+
+            aud_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            aud_tmp.write(media["audio_bytes"])
+            aud_tmp.close()
+            temp_files.append(aud_tmp.name)
+
+            audio_clip = AudioFileClip(aud_tmp.name)
+            duration = audio_clip.duration + 0.4  # 문장 끝 여운 0.4초 추가
+
+            # 원본 이미지 로드 및 자막 레이어 생성
+            base_img = Image.open(img_tmp.name).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+            sub_overlay = create_subtitle_overlay(W, H, sc["narration"], font_path)
+
+            # 시간(t)에 따라 1.0배 -> 1.12배 부드럽게 줌인하는 프레임 생성 함수
+            def make_scene_frame(t, img=base_img, sub=sub_overlay, dur=duration):
+                zoom = 1.0 + 0.12 * (t / max(dur, 0.1))
+                new_w = int(W * zoom)
+                new_h = int(H * zoom)
+                zoomed = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                left = (new_w - W) // 2
+                top = (new_h - H) // 2
+                cropped = zoomed.crop((left, top, left + W, top + H)).convert("RGBA")
+                combined = Image.alpha_composite(cropped, sub).convert("RGB")
+                return np.array(combined)
+
+            v_clip = VideoClip(make_scene_frame, duration=duration).set_audio(audio_clip)
+            clips.append(v_clip)
+
+        final_video = concatenate_videoclips(clips, method="compose")
+        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        out_tmp.close()
+
+        final_video.write_videofile(
+            out_tmp.name,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            preset="ultrafast",
+            threads=2,
+            logger=None
+        )
+        final_video.close()
+        for c in clips:
+            c.close()
+
+        return out_tmp.name
+    finally:
+        for tf in temp_files:
+            if os.path.exists(tf):
+                try:
+                    os.remove(tf)
+                except Exception:
+                    pass
+
 # 세션 상태 초기화
 if "analysis_result" not in st.session_state:
     st.session_state.analysis_result = ""
@@ -185,6 +322,8 @@ if "generated_scenes" not in st.session_state:
     st.session_state.generated_scenes = None
 if "scene_media" not in st.session_state:
     st.session_state.scene_media = {}
+if "final_video_bytes" not in st.session_state:
+    st.session_state.final_video_bytes = None
 
 # ==========================================
 # [1단계] 레퍼런스 유튜브 영상 분석
@@ -243,7 +382,7 @@ with c1:
         placeholder="예: 한양으로 과거 시험 보러 가던 가난한 선비가 산속 폐가에서 만난 여인의 비밀"
     )
 with c2:
-    scene_count = st.number_input("분할할 장면 수", min_value=4, max_value=20, value=8)
+    scene_count = st.number_input("분할할 장면 수", min_value=3, max_value=15, value=6)
 
 generate_btn = st.button("✍️ 작가 AI에게 대본 의뢰하기", type="primary")
 
@@ -270,26 +409,29 @@ if generate_btn:
                 {reference_guide}
 
                 [작성 규칙]
-                1. narration(대사): 성우가 읽기 좋게 구수하고 긴장감 있는 사극 구어체('~했더랍니다', '~였지요', '~한 것이었습니다')를 사용하세요.
-                2. image_prompt(그림 묘사): 각 장면에 어울리는 조선시대 배경, 인물 표정, 복식, 조명을 영어로 구체적으로 묘사하세요. (단, 화풍 스타일은 시스템에서 자동 추가하므로 장면 내용만 영어로 작성)
+                1. narration(대사): 성우가 읽기 좋고 자막으로 띄우기 알맞게 구수하고 긴장감 있는 사극 구어체('~했더랍니다', '~였지요', '~한 것이었습니다')로 2~3문장 내외로 작성하세요.
+                2. image_prompt(그림 묘사): 각 장면에 어울리는 조선시대 배경, 인물 표정, 복식, 조명을 영어로 구체적으로 묘사하세요. (화풍 스타일은 자동 추가되므로 장면 내용만 영어로 작성)
                 """
 
                 raw_json = call_selected_ai(writer_ai, gen_prompt, is_json=True)
                 st.session_state.generated_scenes = json.loads(raw_json)
                 st.session_state.scene_media = {}
+                st.session_state.final_video_bytes = None
             except Exception as e:
                 st.error(f"대본 생성 오류: {e}")
 
 # ==========================================
-# [3단계] 반자동 검수 + 삽화/성우 AI 즉시 제작
+# [3단계] 반자동 검수 + 삽화/성우 AI 제작
 # ==========================================
 if st.session_state.generated_scenes:
     data = st.session_state.generated_scenes
+    st.divider()
+    st.header("3단계: 대본 다듬기 & 삽화·성우 음성 생성")
     st.subheader(f"🎬 추천 제목: {data['title']}")
     st.info(f"💡 **초반 후킹 포인트:** {data['hook_summary']}")
-    
+
     if not openai_key:
-        st.caption("💡 왼쪽 사이드바에 **OpenAI API 키**를 추가로 입력하시면, 각 장면마다 **AI 삽화 그리기 & 성우 음성 녹음 버튼**이 활성화됩니다!")
+        st.warning("⚠️ 왼쪽 사이드바에 **OpenAI API 키**를 입력하시면 삽화 그리기, 성우 녹음, 최종 MP4 영상 제작 기능이 모두 활성화됩니다.")
 
     edited_scenes = []
     for scene in data["scenes"]:
@@ -300,26 +442,31 @@ if st.session_state.generated_scenes:
             
             with col_text:
                 new_narration = st.text_area(
-                    "내레이션 대본 (수정 가능)",
+                    "내레이션 대본 (수정 가능 - 영상 자막과 성우 음성에 반영됨)",
                     value=scene["narration"],
                     key=f"nar_{s_num}",
-                    height=110
+                    height=105
                 )
             with col_img:
                 full_prompt = f"{style_anchor} {scene['image_prompt']}"
                 new_img_prompt = st.text_area(
-                    "최종 삽화 프롬프트 (화풍 자동 결합됨)",
+                    "최종 삽화 프롬프트",
                     value=full_prompt,
                     key=f"img_{s_num}",
-                    height=110
+                    height=105
                 )
 
-            # OpenAI 키가 연결되어 있으면 삽화 + 성우 음성 바로 생성 버튼 제공
+            edited_scenes.append({
+                "scene_number": s_num,
+                "narration": new_narration,
+                "final_image_prompt": new_img_prompt
+            })
+
             if openai_key:
                 b_col1, b_col2 = st.columns(2)
                 with b_col1:
-                    if st.button(f"🎨 장면 {s_num} 삽화 그리기", key=f"btn_img_{s_num}"):
-                        with st.spinner("조선시대 삽화를 그리는 중..."):
+                    if st.button(f"🎨 장면 {s_num} 삽화만 다시 그리기", key=f"btn_img_{s_num}"):
+                        with st.spinner(f"장면 {s_num} 삽화를 그리는 중..."):
                             try:
                                 oai = OpenAI(api_key=openai_key)
                                 img_res = oai.images.generate(
@@ -329,53 +476,101 @@ if st.session_state.generated_scenes:
                                     quality="standard",
                                     n=1
                                 )
-                                st.session_state.scene_media.setdefault(s_num, {})["image_url"] = img_res.data[0].url
+                                img_bytes = requests.get(img_res.data[0].url, timeout=30).content
+                                st.session_state.scene_media.setdefault(s_num, {})["image_bytes"] = img_bytes
                             except Exception as e:
                                 st.error(f"삽화 생성 실패: {e}")
                 with b_col2:
-                    if st.button(f"🎙️ 장면 {s_num} 성우 녹음하기", key=f"btn_tts_{s_num}"):
-                        with st.spinner("성우 목소리를 녹음하는 중..."):
+                    if st.button(f"🎙️ 장면 {s_num} 음성만 다시 녹음", key=f"btn_tts_{s_num}"):
+                        with st.spinner(f"장면 {s_num} 성우 녹음 중..."):
                             try:
                                 oai = OpenAI(api_key=openai_key)
                                 tts_res = oai.audio.speech.create(
                                     model="tts-1",
-                                    voice="onyx",
+                                    voice=tts_voice,
                                     input=new_narration
                                 )
                                 st.session_state.scene_media.setdefault(s_num, {})["audio_bytes"] = tts_res.content
                             except Exception as e:
                                 st.error(f"음성 생성 실패: {e}")
 
-                # 생성된 미디어 미리보기 출력
                 media = st.session_state.scene_media.get(s_num, {})
                 m_col1, m_col2 = st.columns(2)
                 with m_col1:
-                    if "image_url" in media:
-                        st.image(media["image_url"], caption=f"장면 {s_num} 생성 삽화", use_container_width=True)
+                    if "image_bytes" in media:
+                        st.image(media["image_bytes"], caption=f"장면 {s_num} 삽화", use_container_width=True)
                 with m_col2:
                     if "audio_bytes" in media:
                         st.audio(media["audio_bytes"], format="audio/mp3")
-                        st.download_button(
-                            label=f"⬇️ 장면 {s_num} 음성(.mp3) 다운로드",
-                            data=media["audio_bytes"],
-                            file_name=f"scene_{s_num}.mp3",
-                            mime="audio/mp3",
-                            key=f"dl_audio_{s_num}"
+
+    # 일괄 생성 편의 버튼
+    if openai_key:
+        st.write("")
+        if st.button("⚡ 모든 장면 삽화 + 성우 음성 한 번에 일괄 생성하기", type="secondary", use_container_width=True):
+            progress_bar = st.progress(0, text="전체 장면 삽화와 성우 음성을 순서대로 생성하고 있습니다...")
+            oai = OpenAI(api_key=openai_key)
+            total = len(edited_scenes)
+            try:
+                for idx, sc in enumerate(edited_scenes):
+                    s_num = sc["scene_number"]
+                    progress_bar.progress(idx / total, text=f"장면 {s_num}/{total} 삽화 그리는 중...")
+                    if "image_bytes" not in st.session_state.scene_media.get(s_num, {}):
+                        img_res = oai.images.generate(
+                            model="dall-e-3",
+                            prompt=sc["final_image_prompt"],
+                            size="1792x1024",
+                            quality="standard",
+                            n=1
                         )
+                        img_bytes = requests.get(img_res.data[0].url, timeout=30).content
+                        st.session_state.scene_media.setdefault(s_num, {})["image_bytes"] = img_bytes
 
-            edited_scenes.append({
-                "scene_number": s_num,
-                "narration": new_narration,
-                "final_image_prompt": new_img_prompt
-            })
+                    progress_bar.progress((idx + 0.5) / total, text=f"장면 {s_num}/{total} 성우 음성 녹음 중...")
+                    if "audio_bytes" not in st.session_state.scene_media.get(s_num, {}):
+                        tts_res = oai.audio.speech.create(
+                            model="tts-1",
+                            voice=tts_voice,
+                            input=sc["narration"]
+                        )
+                        st.session_state.scene_media.setdefault(s_num, {})["audio_bytes"] = tts_res.content
 
-    final_output = {
-        "title": data["title"],
-        "scenes": edited_scenes
-    }
-    st.download_button(
-        label="📥 전체 대본 & 프롬프트 기획안 저장 (JSON)",
-        data=json.dumps(final_output, ensure_ascii=False, indent=2),
-        file_name="yadam_script.json",
-        mime="application/json"
+                progress_bar.progress(1.0, text="✅ 모든 장면의 삽화와 성우 음성 생성이 완료되었습니다!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"일괄 생성 중 오류 발생: {e}")
+
+    # ==========================================
+    # [4단계] 최종 MP4 동영상 자동 조립 및 다운로드
+    # ==========================================
+    st.divider()
+    st.header("4단계: 줌인 효과 & 한글 자막 MP4 영상 자동 완성")
+    
+    ready_count = sum(
+        1 for sc in edited_scenes
+        if "image_bytes" in st.session_state.scene_media.get(sc["scene_number"], {})
+        and "audio_bytes" in st.session_state.scene_media.get(sc["scene_number"], {})
     )
+    st.write(f"현재 준비된 장면: **{ready_count} / {len(edited_scenes)}개** (모든 장면의 그림과 음성이 준비되면 영상을 합칠 수 있습니다)")
+
+    if st.button("🎬 최종 MP4 동영상 합치기 (줌인 효과 + 자막)", type="primary", disabled=(ready_count < len(edited_scenes))):
+        with st.spinner("한글 폰트를 불러오고 모든 장면에 줌인 효과와 자막을 입혀 MP4 영상을 렌더링하는 중입니다... (약 20~40초 소요)"):
+            try:
+                font_path = get_korean_font_path()
+                mp4_path = build_final_mp4(edited_scenes, st.session_state.scene_media, font_path)
+                with open(mp4_path, "rb") as f:
+                    st.session_state.final_video_bytes = f.read()
+                os.remove(mp4_path)
+                st.success("🎉 야담 영상 렌더링이 완료되었습니다! 아래에서 미리보고 다운로드하세요.")
+            except Exception as e:
+                st.error(f"영상 렌더링 중 오류가 발생했습니다: {e}")
+
+    if st.session_state.final_video_bytes:
+        st.video(st.session_state.final_video_bytes)
+        st.download_button(
+            label="📥 완성된 야담 MP4 동영상 다운로드",
+            data=st.session_state.final_video_bytes,
+            file_name="yadam_final_video.mp4",
+            mime="video/mp4",
+            type="primary",
+            use_container_width=True
+        )
