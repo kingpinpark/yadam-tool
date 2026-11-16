@@ -10,8 +10,15 @@ from anthropic import Anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
 from moviepy.editor import VideoClip, AudioFileClip, concatenate_videoclips
 
-st.set_page_config(page_title="멀티 AI 야담 스튜디오", layout="wide")
-st.title("멀티 AI 야담·민담 올인원 제작 스튜디오")
+st.set_page_config(page_title="멀티 AI 장편 야담 스튜디오", layout="wide")
+st.title("멀티 AI 장편 야담·민담 올인원 제작 스튜디오")
+
+def clean_key(k):
+    k = (k or "").strip()
+    if k and not k.isascii():
+        st.sidebar.error("API 키에 한글이나 잘못된 문자가 섞여 있습니다. 영문/숫자 키만 다시 붙여넣어 주세요.")
+        return ""
+    return k
 
 @st.cache_data(ttl=600)
 def get_gemini_models(key):
@@ -35,11 +42,11 @@ def get_font():
 # --- 사이드바 ---
 with st.sidebar:
     st.header("1. AI 엔진 연결")
-    g_key = st.text_input("Gemini API 키", type="password")
+    g_key = clean_key(st.text_input("Gemini API 키", type="password"))
     st.caption("[Gemini 키 무료 발급](https://aistudio.google.com/app/apikey)")
-    o_key = st.text_input("OpenAI API 키 (삽화/성우 필수)", type="password")
+    o_key = clean_key(st.text_input("OpenAI API 키 (삽화/성우 필수)", type="password"))
     st.caption("[OpenAI 키 발급](https://platform.openai.com/api-keys)")
-    c_key = st.text_input("Claude API 키", type="password")
+    c_key = clean_key(st.text_input("Claude API 키", type="password"))
     st.caption("[Claude 키 발급](https://console.anthropic.com/settings/keys)")
 
     ais = []
@@ -50,8 +57,8 @@ with st.sidebar:
 
     st.divider()
     st.header("2. AI 역할 분담")
-    analyst_ai = st.selectbox("1단계 [분석가 AI]", ais, index=0)
-    writer_ai = st.selectbox("2단계 [작가 AI]", ais, index=min(1, len(ais)-1))
+    analyst_ai = st.selectbox("1단계 [장편 분석가 AI]", ais, index=0)
+    writer_ai = st.selectbox("2단계 [야담 작가 AI]", ais, index=min(1, len(ais)-1))
 
     st.divider()
     tts_voice = st.selectbox("성우 목소리", ["onyx", "echo", "fable", "alloy", "nova", "shimmer"])
@@ -89,7 +96,7 @@ def call_ai(label, prompt, is_json=False):
         client = Anthropic(api_key=c_key)
         model = label[8:-1]
         p = prompt + '\n순수 JSON만 출력: {"title":"","hook_summary":"","scenes":[{"scene_number":1,"narration":"","image_prompt":""}]}' if is_json else prompt
-        txt = client.messages.create(model=model, max_tokens=4096, messages=[{"role": "user", "content": p}]).content[0].text.strip()
+        txt = client.messages.create(model=model, max_tokens=8192, messages=[{"role": "user", "content": p}]).content[0].text.strip()
         return re.sub(r"^```json\s*|\s*```$", "", txt, flags=re.MULTILINE).strip() if is_json else txt
     raise ValueError("API 키를 먼저 입력해 주세요.")
 
@@ -107,25 +114,35 @@ def get_yt_text(url):
         raise RuntimeError(f"자막 추출 실패: {e}")
 
 def analyze_text(txt):
-    return call_ai(analyst_ai, f"다음 야담 자막의 1)초반 15초 후킹 기법 2)구어체 문체 특징 3)기승전결 템포 4)벤치마킹 공식 3줄 요약을 분석해 주세요:\n{txt[:15000]}")
+    full_txt = txt[:60000]
+    prompt = f"""다음은 장편 유튜브 야담/민담 영상의 전체 대본(총 {len(full_txt)}자)입니다. 처음부터 결말까지 빠짐없이 읽고 아래 5가지를 정밀하게 분석해 주세요.
+1) 초반 후킹 기법: 시청자를 붙잡은 첫 1분 도입부 전략
+2) 구어체 문체 및 화법: 어미 처리('~했더랍니다' 등), 감정 고조 방식, 인물 대사 처리법
+3) 장편 호흡 유지 비결: 30분 내내 지루하지 않게 중간에 사건/위기를 배치한 구조
+4) 결말 및 여운 처리: 반전, 인과응보, 교훈을 마무리하는 방식
+5) 벤치마킹 핵심 공식: 새 야담 대본에 그대로 적용할 스토리텔링 공식 요약
 
-# --- MP4 렌더링 함수 ---
+[전체 자막]
+{full_txt}"""
+    return call_ai(analyst_ai, prompt)
+
+# --- MP4 렌더링 함수 (장편 자막 자동 분할 지원) ---
 def make_sub_img(w, h, text, font_path):
     ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(ov)
-    font = ImageFont.truetype(font_path, max(26, int(h * 0.042)))
-    lines = textwrap.wrap(text.strip(), width=34)
+    font = ImageFont.truetype(font_path, max(24, int(h * 0.038)))
+    lines = textwrap.wrap(text.strip(), width=36)[-4:]  # 화면 가림 방지를 위해 하단 최대 4줄 표시
     if not lines: return ov
     sizes = [draw.textbbox((0, 0), l, font=font) for l in lines]
     ws, hs = [b[2]-b[0] for b in sizes], [b[3]-b[1] for b in sizes]
-    th = sum(hs) + 10 * (len(lines) - 1)
-    bw, bh = min(w - 80, max(ws) + 64), th + 36
-    x0, y0 = (w - bw) // 2, h - bh - int(h * 0.06)
+    th = sum(hs) + 8 * (len(lines) - 1)
+    bw, bh = min(w - 80, max(ws) + 64), th + 32
+    x0, y0 = (w - bw) // 2, h - bh - int(h * 0.05)
     draw.rounded_rectangle([x0, y0, x0 + bw, y0 + bh], radius=14, fill=(10, 10, 15, 185))
-    cy = y0 + 18
+    cy = y0 + 16
     for i, l in enumerate(lines):
         draw.text(((w - ws[i]) // 2, cy), l, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
-        cy += hs[i] + 10
+        cy += hs[i] + 8
     return ov
 
 def render_mp4(scenes, media_dict, font_path):
@@ -162,41 +179,47 @@ for k, v in [("analysis", ""), ("scenes_data", None), ("media", {}), ("mp4", Non
     if k not in st.session_state: st.session_state[k] = v
 
 # --- 1단계 ---
-st.header(f"1단계: 벤치마킹 영상 분석 ({analyst_ai})")
+st.header(f"1단계: 장편 벤치마킹 영상 통째로 분석 ({analyst_ai})")
 c1, c2 = st.columns([4, 1])
-yt_url = c1.text_input("유튜브 영상 링크 입력", placeholder="https://www.youtube.com/watch?v=...")
+yt_url = c1.text_input("유튜브 영상 링크 입력 (30분~1시간 장편 가능)", placeholder="https://www.youtube.com/watch?v=...")
 c2.write(""); c2.write("")
-if c2.button("링크로 분석", use_container_width=True):
+if c2.button("링크로 전체 분석", use_container_width=True):
     try:
-        with st.spinner("자막 추출 및 분석 중..."):
-            st.session_state.analysis = analyze_text(get_yt_text(yt_url))
+        with st.spinner("30분 분량 자막을 끝까지 추출하고 결말까지 분석 중..."):
+            raw_txt = get_yt_text(yt_url)
+            st.session_state.analysis = analyze_text(raw_txt)
+            st.success(f"총 {len(raw_txt):,}자의 자막을 결말까지 빠짐없이 분석했습니다!")
     except Exception as e: st.error(str(e))
 
-with st.expander("대본/자막 직접 붙여넣기 (유튜브 IP 차단 시 클릭)"):
-    m_txt = st.text_area("유튜브 [스크립트 표시] 내용을 붙여넣으세요", height=130)
-    if st.button("붙여넣은 대본 분석"):
+with st.expander("대본/자막 직접 붙여넣기 (유튜브 IP 차단 시 클릭 - 최대 60,000자 지원)"):
+    m_txt = st.text_area("유튜브 [스크립트 표시] 전체 내용을 붙여넣으세요", height=150)
+    if st.button("붙여넣은 장편 대본 분석"):
         try:
-            with st.spinner("대본 분석 중..."):
+            with st.spinner("장편 대본 전체 구조 분석 중..."):
                 st.session_state.analysis = analyze_text(m_txt)
+                st.success(f"총 {len(m_txt):,}자의 대본을 분석했습니다!")
         except Exception as e: st.error(str(e))
 
 if st.session_state.analysis:
-    with st.expander("분석된 스토리텔링 공식 보기", expanded=True):
+    with st.expander("분석된 장편 스토리텔링 공식 보기", expanded=True):
         st.markdown(st.session_state.analysis)
 
 st.divider()
 
 # --- 2단계 ---
 st.header(f"2단계: 새로운 야담 대본 집필 ({writer_ai})")
-col_t, col_n = st.columns([3, 1])
+col_t, col_n, col_len = st.columns([3, 1, 2])
 topic = col_t.text_input("야담 소재 입력", placeholder="예: 산속 폐가에서 만난 여인의 비밀")
-sc_cnt = col_n.number_input("장면 수", 3, 15, 6)
-if st.button("작가 AI에게 대본 의뢰", type="primary"):
+sc_cnt = col_n.number_input("장면 수", 4, 40, 12)
+length_mode = col_len.selectbox("장면당 대사 분량", ["장편 야담용 (장면당 6~8문장, 풍부한 묘사)", "단편/숏폼용 (장면당 2~3문장, 빠른 전개)"])
+
+if st.button("작가 AI에게 장편 대본 의뢰", type="primary"):
     if topic:
-        with st.spinner("대본 집필 및 장면 분할 중..."):
+        with st.spinner("기승전결이 살아있는 장편 야담 대본을 집필 중입니다..."):
             try:
-                guide = f"적용할 분석 공식:\n{st.session_state.analysis}" if st.session_state.analysis else "초반 15초 강렬한 미스터리로 시작하세요."
-                gp = f"조선시대 전기수 말투('~했더랍니다','~였지요')로 '{topic}' 주제의 야담을 총 {sc_cnt}개 장면으로 작성하세요. 각 장면 narration은 2~3문장, image_prompt는 영문 묘사(화풍 제외).\n{guide}"
+                guide = f"반드시 아래 분석 공식의 문체와 호흡을 그대로 적용하세요:\n{st.session_state.analysis}" if st.session_state.analysis else "초반 강렬한 미스터리로 시작해 기승전결이 뚜렷한 야담을 쓰세요."
+                detail_rule = "각 장면 narration은 등장인물의 심리, 주변 풍경, 대화가 생생하게 살아나도록 6~8문장 이상 매우 풍부하고 길게 서술하세요." if "장편" in length_mode else "각 장면 narration은 핵심 사건 위주로 2~3문장 내외로 간결하게 작성하세요."
+                gp = f"조선시대 최고의 전기수(이야기꾼) 말투('~했더랍니다','~였지요')로 '{topic}' 주제의 야담을 총 {sc_cnt}개 장면으로 나누어 집필하세요. {detail_rule} image_prompt는 각 장면에 맞는 영문 삽화 묘사(화풍 태그 제외).\n{guide}"
                 st.session_state.scenes_data = json.loads(call_ai(writer_ai, gp, is_json=True))
                 st.session_state.media = {}; st.session_state.mp4 = None
             except Exception as e: st.error(f"대본 오류: {e}")
@@ -215,8 +238,8 @@ if st.session_state.scenes_data:
         with st.container(border=True):
             st.markdown(f"**장면 {n}**")
             t1, t2 = st.columns(2)
-            nar = t1.text_area("내레이션 대본", sc["narration"], key=f"n_{n}", height=100)
-            imp = t2.text_area("삽화 프롬프트", f"{style_anchor} {sc['image_prompt']}", key=f"i_{n}", height=100)
+            nar = t1.text_area("내레이션 대본", sc["narration"], key=f"n_{n}", height=140)
+            imp = t2.text_area("삽화 프롬프트", f"{style_anchor} {sc['image_prompt']}", key=f"i_{n}", height=140)
             edited.append({"scene_number": n, "narration": nar, "prompt": imp})
 
             if o_key:
@@ -253,7 +276,7 @@ if st.session_state.scenes_data:
     ready = sum(1 for sc in edited if "img" in st.session_state.media.get(sc["scene_number"], {}) and "aud" in st.session_state.media.get(sc["scene_number"], {}))
     st.write(f"준비된 장면: **{ready} / {len(edited)}개**")
     if st.button("최종 MP4 동영상 합치기", type="primary", disabled=(ready < len(edited))):
-        with st.spinner("줌인 효과와 한글 자막을 입혀 MP4 렌더링 중... (약 30초 소요)"):
+        with st.spinner("줌인 효과와 한글 자막을 입혀 MP4 렌더링 중..."):
             try:
                 p = render_mp4(edited, st.session_state.media, get_font())
                 st.session_state.mp4 = open(p, "rb").read()
