@@ -36,7 +36,7 @@ def get_available_gemini_models(key: str):
     except Exception:
         return ["gemini-3.8-flash"]
 
-# 한글 자막용 폰트 자동 준비 (웹서버/PC 환경 모두 한글 깨짐 방지)
+# 한글 자막용 폰트 자동 준비
 @st.cache_resource
 def get_korean_font_path():
     font_path = os.path.join(tempfile.gettempdir(), "NanumGothicBold.ttf")
@@ -196,7 +196,10 @@ def fetch_youtube_transcript(video_id: str) -> str:
             transcript = ytt_api.fetch(video_id, languages=['ko', 'en'])
             return " ".join([snippet.text for snippet in transcript])
     except Exception as e:
-        raise RuntimeError(f"자막을 가져오지 못했습니다: {e}")
+        err_msg = str(e)
+        if "blocking requests" in err_msg or "IpBlocked" in err_msg or "RequestBlocked" in err_msg:
+            raise RuntimeError("유튜브가 무료 웹서버 IP의 자동 추출을 차단했습니다. 오른쪽 [📝 대본/자막 직접 붙여넣기] 탭을 이용해 주세요!")
+        raise RuntimeError(f"자막 추출 실패: {err_msg}")
 
 # ==========================================
 # MP4 동영상 렌더링 엔진 (줌인 효과 + 한글 자막)
@@ -207,7 +210,6 @@ def create_subtitle_overlay(width: int, height: int, text: str, font_path: str) 
     font_size = max(26, int(height * 0.042))
     font = ImageFont.truetype(font_path, font_size)
 
-    # 긴 대사를 화면 폭에 맞게 2~3줄로 자동 줄바꿈
     wrapped_lines = textwrap.wrap(text.strip(), width=34)
     if not wrapped_lines:
         return overlay
@@ -232,10 +234,8 @@ def create_subtitle_overlay(width: int, height: int, text: str, font_path: str) 
     box_x1 = box_x0 + box_w
     box_y1 = box_y0 + box_h
 
-    # 반투명 어두운 자막 배경 박스
     draw.rounded_rectangle([box_x0, box_y0, box_x1, box_y1], radius=14, fill=(10, 10, 15, 185))
 
-    # 텍스트 그리기 (외곽선 + 흰색 글씨)
     curr_y = box_y0 + padding_y
     for idx, line in enumerate(wrapped_lines):
         tx = (width - line_widths[idx]) // 2
@@ -245,7 +245,7 @@ def create_subtitle_overlay(width: int, height: int, text: str, font_path: str) 
     return overlay
 
 def build_final_mp4(edited_scenes: list, scene_media: dict, font_path: str) -> str:
-    W, H = 1280, 720  # 16:9 HD 해상도 (빠르고 안정적인 웹 렌더링)
+    W, H = 1280, 720
     clips = []
     temp_files = []
 
@@ -256,7 +256,6 @@ def build_final_mp4(edited_scenes: list, scene_media: dict, font_path: str) -> s
             if "image_bytes" not in media or "audio_bytes" not in media:
                 raise ValueError(f"장면 {s_num}의 삽화 또는 성우 음성이 아직 생성되지 않았습니다.")
 
-            # 임시 파일에 이미지와 오디오 저장
             img_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
             img_tmp.write(media["image_bytes"])
             img_tmp.close()
@@ -268,13 +267,11 @@ def build_final_mp4(edited_scenes: list, scene_media: dict, font_path: str) -> s
             temp_files.append(aud_tmp.name)
 
             audio_clip = AudioFileClip(aud_tmp.name)
-            duration = audio_clip.duration + 0.4  # 문장 끝 여운 0.4초 추가
+            duration = audio_clip.duration + 0.4
 
-            # 원본 이미지 로드 및 자막 레이어 생성
             base_img = Image.open(img_tmp.name).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
             sub_overlay = create_subtitle_overlay(W, H, sc["narration"], font_path)
 
-            # 시간(t)에 따라 1.0배 -> 1.12배 부드럽게 줌인하는 프레임 생성 함수
             def make_scene_frame(t, img=base_img, sub=sub_overlay, dur=duration):
                 zoom = 1.0 + 0.12 * (t / max(dur, 0.1))
                 new_w = int(W * zoom)
@@ -325,42 +322,66 @@ if "scene_media" not in st.session_state:
 if "final_video_bytes" not in st.session_state:
     st.session_state.final_video_bytes = None
 
+def run_structure_analysis(script_text: str):
+    prompt = f"""
+    다음은 조회수가 잘 나온 유튜브 야담/민담 영상의 전체 대본(자막)입니다.
+    다른 작가 AI가 이 스타일을 그대로 재현할 수 있도록 핵심 비결을 분석해 주세요.
+    
+    1. 초반 15초 후킹(Hook) 기법: 첫 문장을 어떻게 시작해서 호기심을 자극했는가?
+    2. 화법과 문체 특징: 어미 처리(~했더랍니다, ~였지요 등), 호흡의 길이, 분위기 조성 방식
+    3. 기승전결 전개 비율: 발단-위기-절정-결말이 어떤 템포로 배치되었는가?
+    4. 벤치마킹 핵심 공식: 새로운 야담을 쓸 때 그대로 적용할 스토리텔링 공식 3줄 요약
+
+    [원본 자막/대본]
+    {script_text[:15000]}
+    """
+    return call_selected_ai(analyst_ai, prompt, is_json=False)
+
 # ==========================================
-# [1단계] 레퍼런스 유튜브 영상 분석
+# [1단계] 레퍼런스 유튜브 영상 분석 (링크 추출 + 직접 붙여넣기)
 # ==========================================
 st.header(f"1단계: 벤치마킹 영상 분석 (담당: {analyst_ai})")
-col1, col2 = st.columns([4, 1])
-with col1:
-    youtube_url = st.text_input("유튜브 영상 링크를 붙여넣으세요", placeholder="https://www.youtube.com/watch?v=...")
-with col2:
-    st.write("")
-    st.write("")
-    analyze_btn = st.button("🔍 영상 구조 분석하기", use_container_width=True)
 
-if analyze_btn:
-    if not youtube_url:
-        st.warning("유튜브 링크를 입력해 주세요.")
-    else:
-        video_id = extract_video_id(youtube_url)
-        if not video_id:
-            st.error("올바른 유튜브 링크가 아닙니다.")
+tab_url, tab_paste = st.tabs(["🔗 유튜브 링크로 자동 분석", "📝 대본/자막 직접 붙여넣기 (유튜브 IP 차단 시)"])
+
+with tab_url:
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        youtube_url = st.text_input("유튜브 영상 링크를 붙여넣으세요", placeholder="https://www.youtube.com/watch?v=...")
+    with col2:
+        st.write("")
+        st.write("")
+        analyze_url_btn = st.button("🔍 링크로 분석하기", use_container_width=True)
+
+    if analyze_url_btn:
+        if not youtube_url:
+            st.warning("유튜브 링크를 입력해 주세요.")
         else:
-            with st.spinner(f"[{analyst_ai}]가 영상을 분석하고 공식을 추출하는 중입니다..."):
-                try:
-                    transcript_text = fetch_youtube_transcript(video_id)
-                    prompt = f"""
-                    다음은 조회수가 잘 나온 유튜브 야담/민담 영상의 전체 자막입니다.
-                    다른 작가 AI가 이 스타일을 그대로 재현할 수 있도록 핵심 비결을 분석해 주세요.
-                    
-                    1. 초반 15초 후킹(Hook) 기법: 첫 문장을 어떻게 시작해서 호기심을 자극했는가?
-                    2. 화법과 문체 특징: 어미 처리(~했더랍니다, ~였지요 등), 호흡의 길이, 분위기 조성 방식
-                    3. 기승전결 전개 비율: 발단-위기-절정-결말이 어떤 템포로 배치되었는가?
-                    4. 벤치마킹 핵심 공식: 새로운 야담을 쓸 때 그대로 적용할 스토리텔링 공식 3줄 요약
+            video_id = extract_video_id(youtube_url)
+            if not video_id:
+                st.error("올바른 유튜브 링크가 아닙니다.")
+            else:
+                with st.spinner(f"[{analyst_ai}]가 자막을 추출하고 분석하는 중입니다..."):
+                    try:
+                        transcript_text = fetch_youtube_transcript(video_id)
+                        st.session_state.analysis_result = run_structure_analysis(transcript_text)
+                    except Exception as e:
+                        st.error(f"{e}")
 
-                    [원본 자막]
-                    {transcript_text[:15000]}
-                    """
-                    st.session_state.analysis_result = call_selected_ai(analyst_ai, prompt, is_json=False)
+with tab_paste:
+    st.caption("💡 유튜브 영상 설명란의 **[스크립트 표시]**를 눌러 전체 자막을 복사한 뒤 아래에 붙여넣으면 100% 분석됩니다.")
+    manual_transcript = st.text_area(
+        "벤치마킹할 야담 영상의 자막(스크립트)이나 참고할 옛이야기 본문을 붙여넣으세요",
+        height=160,
+        placeholder="여기에 복사한 유튜브 스크립트나 야담 텍스트를 붙여넣으세요..."
+    )
+    if st.button("🔍 붙여넣은 대본 구조 분석하기", type="secondary"):
+        if not manual_transcript.strip():
+            st.warning("분석할 텍스트를 먼저 붙여넣어 주세요.")
+        else:
+            with st.spinner(f"[{analyst_ai}]가 붙여넣은 대본의 구조를 분석하는 중입니다..."):
+                try:
+                    st.session_state.analysis_result = run_structure_analysis(manual_transcript)
                 except Exception as e:
                     st.error(f"분석 오류: {e}")
 
@@ -503,7 +524,6 @@ if st.session_state.generated_scenes:
                     if "audio_bytes" in media:
                         st.audio(media["audio_bytes"], format="audio/mp3")
 
-    # 일괄 생성 편의 버튼
     if openai_key:
         st.write("")
         if st.button("⚡ 모든 장면 삽화 + 성우 음성 한 번에 일괄 생성하기", type="secondary", use_container_width=True):
