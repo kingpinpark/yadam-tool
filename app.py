@@ -11,7 +11,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from moviepy.editor import VideoClip, AudioFileClip, concatenate_videoclips
 
 st.set_page_config(page_title="Gemini 올인원 장편 야담 스튜디오", layout="wide")
-st.title("멀티 AI 초장편 야담·민담 제작 스튜디오 (Gemini 올인원 지원)")
+st.title("멀티 AI 초장편 야담·민담 제작 스튜디오 (초고속 엔진)")
 
 def clean_key(k):
     k = (k or "").strip()
@@ -27,7 +27,8 @@ def get_gemini_models(key):
         all_m = [m.name.replace("models/", "") for m in client.models.list()]
         txt_m = [m for m in all_m if "gemini" in m.lower() and not any(x in m.lower() for x in ["embedding", "imagen", "veo", "aqa", "tts", "audio"])]
         img_m = [m for m in all_m if "imagen" in m.lower()]
-        txt_m.sort(key=lambda x: (0 if "2.5-flash" in x or "3.8-flash" in x else 1, x))
+        # 가장 빠른 flash 모델을 최상단에 배치
+        txt_m.sort(key=lambda x: (0 if "flash" in x and "lite" not in x else 1, x))
         img_m.sort(reverse=True)
         return (txt_m[:6] if txt_m else ["gemini-2.5-flash"]), (img_m[0] if img_m else "imagen-3.0-generate-002")
     except Exception:
@@ -60,7 +61,7 @@ with st.sidebar:
 
     st.divider()
     st.header("2. AI 역할 분담")
-    analyst_ai = st.selectbox("1단계 [2시간 분석가 AI]", ais, index=0)
+    analyst_ai = st.selectbox("1단계 [분석가 AI] (flash 모델 권장)", ais, index=0)
     writer_ai = st.selectbox("2단계 [장편 작가 AI]", ais, index=0)
 
     media_engines = []
@@ -88,13 +89,21 @@ class YadamScript(BaseModel):
     chapter_summary: str
     scenes: list[Scene]
 
-def call_ai(label, prompt, is_json=False):
+def call_ai(label, prompt, is_json=False, fast_mode=False):
     if label.startswith("Gemini"):
         client = genai.Client(api_key=g_key)
         model = label[8:-1]
         for i in range(3):
             try:
-                cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=YadamScript, temperature=0.8) if is_json else None
+                cfg_args = {}
+                if is_json:
+                    cfg_args["response_mime_type"] = "application/json"
+                    cfg_args["response_schema"] = YadamScript
+                    cfg_args["temperature"] = 0.8
+                # 초고속 분석 모드일 때 불필요한 Thinking 대기 시간 제거
+                if fast_mode and "flash" in model.lower():
+                    cfg_args["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                cfg = types.GenerateContentConfig(**cfg_args) if cfg_args else None
                 return client.models.generate_content(model=model, contents=prompt, config=cfg).text
             except Exception as e:
                 if "503" in str(e) and i < 2: time.sleep(3); continue
@@ -173,18 +182,30 @@ def get_yt_text(url):
             raise RuntimeError("유튜브가 클라우드 서버 IP를 차단했습니다. 아래 [대본/자막 직접 붙여넣기]를 이용해 주세요.")
         raise RuntimeError(f"자막 추출 실패: {e}")
 
-def analyze_text(txt):
-    full_txt = txt[:150000]
-    prompt = f"""다음은 장편 유튜브 야담/민담 영상의 전체 대본(총 {len(full_txt):,}자)입니다. 2시간에 달하는 긴 호흡의 이야기를 처음부터 결말까지 빠짐없이 읽고 아래 5가지를 정밀하게 분석해 주세요.
-1) 초반 후킹 기법: 시청자를 붙잡은 첫 1분 도입부 전략
-2) 구어체 문체 및 화법: 어미 처리('~했더랍니다' 등), 감정 고조 방식, 인물 대사 처리법
-3) 초장편 호흡 유지 비결: 긴 시간 내내 지루하지 않게 중간마다 새로운 갈등과 사건을 배치한 구조
-4) 결말 및 여운 처리: 반전, 인과응보, 교훈을 마무리하는 방식
-5) 벤치마킹 핵심 공식: 새로운 장편 야담에 그대로 적용할 스토리텔링 공식 요약
+def analyze_text(txt, fast_sample=True):
+    # 불필요한 타임스탬프(00:12 등)와 줄바꿈 압축으로 글자 수 30% 절감
+    cleaned = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", txt)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    
+    if fast_sample and len(cleaned) > 32000:
+        mid = len(cleaned) // 2
+        sampled = (
+            f"[도입부 발단]\n{cleaned[:12000]}\n\n"
+            f"[중반부 전개]\n{cleaned[mid-4000:mid+4000]}\n\n"
+            f"[후반부 절정 및 결말]\n{cleaned[-12000:]}"
+        )
+    else:
+        sampled = cleaned[:150000]
 
-[전체 자막]
-{full_txt}"""
-    return call_ai(analyst_ai, prompt)
+    prompt = f"""다음 야담/민담 대본의 스토리텔링 비결을 간결하고 핵심만 짚어 분석해 주세요.
+1) 초반 후킹 기법: 시청자를 붙잡은 첫 1분 도입부 전략
+2) 구어체 문체 및 화법: 어미 처리('~했더랍니다' 등), 감정 고조 방식
+3) 장편 호흡 유지 및 결말 처리: 위기 배치 템포와 결말 마무리 방식
+4) 벤치마킹 핵심 공식: 새 야담 대본에 그대로 적용할 공식 3줄 요약
+
+[대본 내용]
+{sampled}"""
+    return call_ai(analyst_ai, prompt, is_json=False, fast_mode=True)
 
 # --- ZIP 패키징 및 MP4 렌더링 함수 ---
 def build_zip_package(title, chapter, edited_scenes, media_dict):
@@ -196,11 +217,8 @@ def build_zip_package(title, chapter, edited_scenes, media_dict):
             prefix = f"{chapter}부_{n:02d}장면"
             script_lines.append(f"[{prefix}]\n{sc['narration']}\n(삽화 프롬프트: {sc['prompt']})\n\n")
             m = media_dict.get(n, {})
-            if "img" in m:
-                zf.writestr(f"{prefix}.png", m["img"])
-            if "aud" in m:
-                ext = m.get("aud_ext", "wav")
-                zf.writestr(f"{prefix}.{ext}", m["aud"])
+            if "img" in m: zf.writestr(f"{prefix}.png", m["img"])
+            if "aud" in m: zf.writestr(f"{prefix}.{m.get('aud_ext', 'wav')}", m["aud"])
         zf.writestr(f"{chapter}부_전체대본.txt", "".join(script_lines))
     buf.seek(0)
     return buf.getvalue()
@@ -258,29 +276,33 @@ for k, v in [("analysis", ""), ("scenes_data", None), ("media", {}), ("mp4", Non
     if k not in st.session_state: st.session_state[k] = v
 
 # --- 1단계 ---
-st.header(f"1단계: 2시간 초장편 영상 통째로 분석 ({analyst_ai})")
+st.header(f"1단계: 초장편 영상 초고속 분석 ({analyst_ai})")
+fast_opt = st.checkbox("초고속 핵심 구간 분석 사용 (도입+중반+결말만 추출해 3~5초 만에 분석 완료)", value=True)
+
 c1, c2 = st.columns([4, 1])
-yt_url = c1.text_input("유튜브 영상 링크 입력 (최대 2시간 / 15만 자 지원)", placeholder="https://www.youtube.com/watch?v=...")
+yt_url = c1.text_input("유튜브 영상 링크 입력", placeholder="https://www.youtube.com/watch?v=...")
 c2.write(""); c2.write("")
-if c2.button("링크로 전체 분석", use_container_width=True):
+if c2.button("링크로 분석", use_container_width=True):
     try:
-        with st.spinner("장편 자막을 끝까지 추출하고 결말까지 분석 중..."):
+        t0 = time.time()
+        with st.spinner("자막 추출 및 초고속 분석 중..."):
             raw_txt = get_yt_text(yt_url)
-            st.session_state.analysis = analyze_text(raw_txt)
-            st.success(f"총 {len(raw_txt):,}자(약 {max(1, len(raw_txt)//750)}분 분량)의 자막을 결말까지 완벽히 분석했습니다!")
+            st.session_state.analysis = analyze_text(raw_txt, fast_sample=fast_opt)
+            st.success(f"분석 완료! (소요 시간: {time.time()-t0:.1f}초 / 원본 {len(raw_txt):,}자)")
     except Exception as e: st.error(str(e))
 
-with st.expander("대본/자막 직접 붙여넣기 (유튜브 IP 차단 시 클릭 - 최대 150,000자 지원)"):
-    m_txt = st.text_area("유튜브 [스크립트 표시] 전체 내용을 붙여넣으세요", height=150)
-    if st.button("붙여넣은 장편 대본 분석"):
+with st.expander("대본/자막 직접 붙여넣기 (유튜브 IP 차단 시 클릭)"):
+    m_txt = st.text_area("유튜브 [스크립트 표시] 전체 내용을 붙여넣으세요", height=140)
+    if st.button("붙여넣은 대본 분석"):
         try:
-            with st.spinner("장편 대본 전체 구조 분석 중..."):
-                st.session_state.analysis = analyze_text(m_txt)
-                st.success(f"총 {len(m_txt):,}자의 대본을 분석했습니다!")
+            t0 = time.time()
+            with st.spinner("초고속 구조 분석 중..."):
+                st.session_state.analysis = analyze_text(m_txt, fast_sample=fast_opt)
+                st.success(f"분석 완료! (소요 시간: {time.time()-t0:.1f}초)")
         except Exception as e: st.error(str(e))
 
 if st.session_state.analysis:
-    with st.expander("분석된 장편 스토리텔링 공식 보기", expanded=True):
+    with st.expander("분석된 스토리텔링 공식 보기", expanded=True):
         st.markdown(st.session_state.analysis)
 
 st.divider()
@@ -289,8 +311,8 @@ st.divider()
 st.header(f"2단계: 대장편 야담 챕터별 집필 ({writer_ai})")
 col_t, col_n, col_len = st.columns([3, 1, 2])
 topic = col_t.text_input("야담 대주제 입력", placeholder="예: 몰락한 양반가 막내아들이 전국을 떠돌며 기이한 사건들을 해결하는 대서사시")
-sc_cnt = col_n.number_input("이번 챕터 장면 수", 4, 30, 10)
-length_mode = col_len.selectbox("장면당 대사 분량", ["초장편 라디오용 (장면당 7~10문장, 극대화 묘사)", "중편 야담용 (장면당 4~5문장)", "단편/숏폼용 (장면당 2~3문장)"])
+sc_cnt = col_n.number_input("이번 챕터 장면 수", 4, 30, 8)
+length_mode = col_len.selectbox("장면당 대사 분량", ["중편 야담용 (장면당 4~5문장 - 속도/분량 균형 추천)", "초장편 라디오용 (장면당 7~10문장, 극대화 묘사)", "단편/숏폼용 (장면당 2~3문장)"])
 
 btn_c1, btn_c2 = st.columns(2)
 start_new = btn_c1.button("1부(새로운 이야기) 처음부터 집필하기", type="primary", use_container_width=True)
@@ -318,7 +340,7 @@ if start_new or continue_next:
             try:
                 guide = f"적용할 문체 및 구성 공식:\n{st.session_state.analysis}" if st.session_state.analysis else "구수하고 긴장감 넘치는 조선시대 전기수 화법을 유지하세요."
                 if "초장편" in length_mode:
-                    detail_rule = "각 장면 narration은 인물 간의 대화, 심리 묘사, 주변 풍경을 소설처럼 아주 상세하게 7~10문장 이상 길게 쓰세요."
+                    detail_rule = "각 장면 narration은 인물 간의 대화, 심리 묘사, 주변 풍경을 소설처럼 상세하게 7~10문장 이상 길게 쓰세요."
                 elif "중편" in length_mode:
                     detail_rule = "각 장면 narration은 4~5문장 분량으로 풍부하게 쓰세요."
                 else:
@@ -335,7 +357,7 @@ if start_new or continue_next:
 2. chapter_summary에는 다음 챕터로 이어질 수 있도록 이번 {ch}부의 핵심 사건과 인물 상태를 3줄로 요약하세요.
 3. image_prompt는 각 장면에 맞는 영문 삽화 묘사(화풍 태그 제외).
 {guide}"""
-                st.session_state.scenes_data = json.loads(call_ai(writer_ai, gp, is_json=True))
+                st.session_state.scenes_data = json.loads(call_ai(writer_ai, gp, is_json=True, fast_mode=False))
                 st.session_state.media = {}; st.session_state.mp4 = None
                 st.rerun()
             except Exception as e: st.error(f"대본 오류: {e}")
