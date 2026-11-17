@@ -9,3 +9,4 @@ pillow
 numpy
 requests
 edge-tts
+yt-dlp
