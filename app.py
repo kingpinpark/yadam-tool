@@ -92,7 +92,7 @@ tab_yadam, tab_shorts = st.tabs(["📜 초장편 야담 스튜디오", "📱 카
 
 tab_yadam, tab_shorts = st.tabs([
     "📜 초장편 야담 스튜디오",
-    "📱 카테고리형 숏폼 스튜디오 (직접 편집 지원)"
+    "📱 카테고리형 숏폼 스튜디오 (링크 추출 + 직접 편집)"
 ])
 
 with tab_yadam:
@@ -215,16 +215,72 @@ with tab_yadam:
         st.download_button(f"📥 [{ch}부] 소스 ZIP 다운로드", z_buf.getvalue(), f"yadam_part{ch}.zip", "application/zip", use_container_width=True)
 
 # =========================================================
-# [탭 2] 카테고리형 숏폼 제작 + 결과물 실시간 직접 수정 에디터
+# [탭 2] 카테고리형 숏폼 제작 (유튜브/틱톡 링크 + 파일 업로드 + 직접 편집)
 # =========================================================
 with tab_shorts:
     st.subheader("📱 카테고리형 숏폼 제작 & 실시간 편집기 (608×1080)")
-    sc1, sc2 = st.columns([2, 1])
-    up_vid = sc1.file_uploader("1. 원본 영상 업로드 (.mp4, .mov)", type=["mp4", "mov", "mkv"])
-    s_lang = sc2.selectbox("언어 & 성우 (+50%)", ["한국어 (InJoon +50%)", "일본어 (Nanami +50%)"])
 
-    if up_vid is not None:
-        st.session_state["sh_raw_vid"] = up_vid.getvalue()
+    def download_video_from_url(url_str):
+        import yt_dlp
+        tmp_dir = tempfile.mkdtemp()
+        out_tpl = os.path.join(tmp_dir, "src.%(ext)s")
+        ydl_opts = {
+            "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "outtmpl": out_tpl,
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "max_filesize": 150 * 1024 * 1024,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url_str, download=True)
+            v_title = info.get("title", "")
+        files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
+        if not files:
+            raise RuntimeError("영상을 다운로드하지 못했습니다.")
+        v_bytes = open(files[0], "rb").read()
+        for f in files:
+            try: os.remove(f)
+            except Exception: pass
+        return v_bytes, v_title
+
+    st.markdown("### 1️⃣ 원본 영상 불러오기 (링크 추출 또는 파일 업로드)")
+    src_tab_url, src_tab_file = st.tabs(["🔗 유튜브 / 틱톡 / 릴스 링크로 불러오기", "📁 내 기기에서 영상 파일 업로드"])
+
+    with src_tab_url:
+        uc1, uc2 = st.columns([4, 1])
+        sh_url = uc1.text_input("영상 URL 입력 (YouTube Shorts, TikTok, Instagram Reels 등)", placeholder="https://www.tiktok.com/... 또는 https://youtube.com/shorts/...")
+        uc2.write(""); uc2.write("")
+        if uc2.button("⬇️ 영상 가져오기", type="primary", use_container_width=True):
+            if not sh_url.strip():
+                st.warning("영상 링크를 먼저 입력해 주세요.")
+            else:
+                with st.spinner("원본 영상을 서버로 다운로드 중입니다 (10~25초)..."):
+                    try:
+                        vb, vtitle = download_video_from_url(sh_url.strip())
+                        st.session_state["sh_raw_vid"] = vb
+                        st.session_state["sh_src_name"] = vtitle or "링크 다운로드 영상"
+                        st.success(f"✅ 불러오기 완료: {st.session_state['sh_src_name']}")
+                    except Exception as e:
+                        st.error(f"링크 다운로드 실패 (비공개 영상이거나 클라우드 IP가 차단된 경우 옆 탭에서 파일을 직접 올려주세요): {e}")
+
+    with src_tab_file:
+        up_vid = st.file_uploader("원본 영상 파일 선택 (.mp4, .mov, .mkv)", type=["mp4", "mov", "mkv"])
+        if up_vid is not None:
+            st.session_state["sh_raw_vid"] = up_vid.getvalue()
+            st.session_state["sh_src_name"] = up_vid.name
+
+    if "sh_raw_vid" in st.session_state:
+        with st.expander(f"🎞️ 불러온 원본 영상 확인 및 사용할 구간 자르기 ({st.session_state.get('sh_src_name', '원본')})", expanded=False):
+            st.video(st.session_state["sh_raw_vid"])
+            tc1, tc2 = st.columns(2)
+            clip_start = tc1.number_input("원본 시작 시점 (초)", min_value=0.0, value=0.0, step=0.5)
+            clip_dur = tc2.number_input("사용할 길이 (초, 0이면 자막 끝까지 자동)", min_value=0.0, value=0.0, step=0.5)
+    else:
+        clip_start, clip_dur = 0.0, 0.0
+
+    st.divider()
+    s_lang = st.selectbox("제작 언어 & 성우 (+50% 배속)", ["한국어 (InJoon +50%)", "일본어 (Nanami +50%)"])
 
     if "sh_rows" not in st.session_state:
         st.session_state["sh_rows"] = [
@@ -234,7 +290,7 @@ with tab_shorts:
             {"시작(초)": 7.0, "끝(초)": 9.5, "자막(*초록강조* / (속마음))": "결국 레전드를 찍었다고 .."},
         ]
 
-    s_desc = st.text_input("2. AI 초안 자동 생성용 상황 설명 (선택 사항 — 아래 표에서 직접 수정 가능)")
+    s_desc = st.text_input("2️⃣ AI 초안 자동 생성용 상황 설명 (선택 사항 — 아래 표에서 직접 수정 가능)", value=st.session_state.get("sh_src_name", ""))
     if st.button("✨ AI로 제목·훅·자막 초안 채우기", use_container_width=True) and s_desc:
         try:
             l_rule = "일본어 작성, 끝은 '~って…'" if "일본어" in s_lang else "한국어, 연결형(~하고/~했는데), 속마음 (괄호), 강조 *별표*, 끝은 '~다고 ..'"
@@ -254,7 +310,7 @@ with tab_shorts:
             st.warning(f"AI 서버 혼잡으로 자동 생성을 건너뜁니다. 아래 표에서 직접 입력해 주세요: {e}")
 
     st.divider()
-    st.markdown("### 🎛️ 3. 제목 · 훅 음성 · 컷별 자막 직접 편집")
+    st.markdown("### 🎛️ 3️⃣ 제목 · 훅 음성 · 컷별 자막 직접 편집")
     ct1, ct2 = st.columns(2)
     t_l1 = ct1.text_input("상단 제목 1줄 (흰색)", value=st.session_state.get("sh_t1", "아니 이게 진짜 된다고?"))
     t_l2 = ct2.text_input("상단 제목 2줄 (노란 강조)", value=st.session_state.get("sh_t2", "결말까지 보면 무조건 놀람"))
@@ -274,7 +330,7 @@ with tab_shorts:
         }
     )
 
-    with st.expander("🎨 4. 영상 구도(배율·Y위치) & 글자 크기·볼륨 미세 조정", expanded=True):
+    with st.expander("🎨 4️⃣ 영상 구도(배율·Y위치) & 글자 크기·볼륨 미세 조정", expanded=True):
         g1, g2, g3 = st.columns(3)
         vid_zoom = g1.slider("영상 확대 배율", 0.8, 1.8, 1.0, 0.05)
         vid_y_off = g2.slider("영상 상하(Y) 위치 이동 (px)", -200, 200, 0, 10)
@@ -321,8 +377,12 @@ with tab_shorts:
                     p_subs[0]["end"] = round(h_dur + 0.2, 2)
 
                 sc = VideoFileClip(vt.name)
-                tdur = min(sc.duration, max([s["end"] for s in p_subs], default=10.0))
-                sc = sc.subclip(0, tdur)
+                s_start = min(clip_start, max(0.0, sc.duration - 0.5))
+                max_sub_end = max([s["end"] for s in p_subs], default=10.0)
+                target_len = clip_dur if clip_dur > 0 else max_sub_end
+                tdur = min(sc.duration - s_start, target_len)
+                sc = sc.subclip(s_start, s_start + tdur)
+
                 fp = get_font()
                 ft, fs = ImageFont.truetype(fp, title_sz), ImageFont.truetype(fp, sub_sz)
 
@@ -387,13 +447,12 @@ with tab_shorts:
         with pv1:
             st.video(st.session_state.shorts_mp4)
         with pv2:
-            st.info("💡 **즉시 수정 가이드**\n- 피사체가 잘렸다면 **4번 구도 패널**에서 `영상 확대 배율`이나 `상하(Y) 위치`를 조절하세요.\n- 자막 타이밍이나 강조 색(`*단어*`)을 바꾸려면 **3번 자막 표**를 고친 뒤 위의 **[재렌더링]** 버튼을 다시 누르면 원본 재업로드 없이 바로 새 영상이 만들어집니다.")
+            st.info("💡 **즉시 수정 가이드**\n- 긴 영상을 링크로 가져왔다면 **1번 구간 자르기**에서 `원본 시작 시점(초)`을 조절해 하이라이트 부분만 잘라낼 수 있습니다.\n- 피사체가 잘렸다면 **4번 구도 패널**에서 `영상 확대 배율`이나 `상하(Y) 위치`를 조절하세요.")
             st.download_button(
                 "📥 완성된 숏폼 MP4 다운로드",
                 st.session_state.shorts_mp4, "category_shorts.mp4",
                 "video/mp4", type="primary", use_container_width=True
             )
-            # 2차 외부 편집기(캡컷/프리미어)용 SRT + 훅음성 + JSON ZIP 패키지
             srt_lines = []
             for idx, s in enumerate(p_subs, 1):
                 def fmt_t(sec):
@@ -412,4 +471,3 @@ with tab_shorts:
                 sz_buf.getvalue(), "shorts_edit_package.zip",
                 "application/zip", use_container_width=True
             )
-
