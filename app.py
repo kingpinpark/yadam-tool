@@ -90,6 +90,11 @@ def call_ai(label, prompt, is_json=False, fast=False):
 
 tab_yadam, tab_shorts = st.tabs(["📜 초장편 야담 스튜디오", "📱 카테고리형 숏폼 제작 (608×1080)"])
 
+tab_yadam, tab_shorts = st.tabs([
+    "📜 초장편 야담 스튜디오",
+    "📱 카테고리형 숏폼 스튜디오 (직접 편집 지원)"
+])
+
 with tab_yadam:
     st.subheader("1단계: 벤치마킹 유튜브 영상 분석")
     fast_opt = st.checkbox("⚡ 초고속 핵심 구간 분석 (3~5초)", value=True)
@@ -101,10 +106,15 @@ with tab_yadam:
             m = re.search(r"(?:v=|\/|shorts\/)([0-9A-Za-z_-]{11})", yt_url or "")
             if not m: raise ValueError("올바른 링크를 입력하세요.")
             vid = m.group(1)
-            raw = " ".join(x["text"] for x in YouTubeTranscriptApi.get_transcript(vid, languages=["ko", "en"])) if hasattr(YouTubeTranscriptApi, "get_transcript") else " ".join(x.text for x in YouTubeTranscriptApi().fetch(vid, languages=["ko", "en"]))
+            raw = (
+                " ".join(x["text"] for x in YouTubeTranscriptApi.get_transcript(vid, languages=["ko", "en"]))
+                if hasattr(YouTubeTranscriptApi, "get_transcript")
+                else " ".join(x.text for x in YouTubeTranscriptApi().fetch(vid, languages=["ko", "en"]))
+            )
             st.session_state.analysis = call_ai(analyst_ai, f"야담의 1)후킹 2)화법 3)전개 4)공식 3줄 요약:\n{raw[:25000]}", fast=True)
             st.success("분석 완료!")
-        except Exception as e: st.error(f"자막 추출 실패(아래 직접 붙여넣기 이용): {e}")
+        except Exception as e:
+            st.error(f"자막 추출 실패(아래 직접 붙여넣기 이용): {e}")
 
     with st.expander("📝 대본/자막 직접 붙여넣기"):
         m_txt = st.text_area("스크립트 붙여넣기", height=100)
@@ -113,7 +123,8 @@ with tab_yadam:
             st.session_state.analysis = call_ai(analyst_ai, f"야담의 1)후킹 2)화법 3)전개 4)공식 3줄 요약:\n{c}", fast=True)
 
     if st.session_state.analysis:
-        with st.expander("📊 분석 공식 보기", expanded=True): st.markdown(st.session_state.analysis)
+        with st.expander("📊 분석 공식 보기", expanded=True):
+            st.markdown(st.session_state.analysis)
 
     st.divider()
     st.subheader("2단계: 대장편 야담 챕터별 대본 집필")
@@ -126,7 +137,8 @@ with tab_yadam:
     c_nxt = b2.button(f"이어서 [{st.session_state.ch + 1}부] 집필", disabled=(not st.session_state.scenes_data), use_container_width=True)
 
     if (s_new or c_nxt) and topic:
-        if s_new: st.session_state.ch, st.session_state.hist = 1, []
+        if s_new:
+            st.session_state.ch, st.session_state.hist = 1, []
         else:
             st.session_state.hist.append(f"[{st.session_state.ch}부]: {st.session_state.scenes_data.get('chapter_summary','')}")
             st.session_state.ch += 1
@@ -202,68 +214,142 @@ with tab_yadam:
                 if "aud" in m: zf.writestr(f"part{ch}_{n:02d}.{m.get('ext','mp3')}", m["aud"])
         st.download_button(f"📥 [{ch}부] 소스 ZIP 다운로드", z_buf.getvalue(), f"yadam_part{ch}.zip", "application/zip", use_container_width=True)
 
+# =========================================================
+# [탭 2] 카테고리형 숏폼 제작 + 결과물 실시간 직접 수정 에디터
+# =========================================================
 with tab_shorts:
-    st.subheader("📱 카테고리형 숏폼 제작기 (608×1080 / 상단 280px 제목 / 훅 +50%)")
+    st.subheader("📱 카테고리형 숏폼 제작 & 실시간 편집기 (608×1080)")
     sc1, sc2 = st.columns([2, 1])
     up_vid = sc1.file_uploader("1. 원본 영상 업로드 (.mp4, .mov)", type=["mp4", "mov", "mkv"])
     s_lang = sc2.selectbox("언어 & 성우 (+50%)", ["한국어 (InJoon +50%)", "일본어 (Nanami +50%)"])
-    s_desc = st.text_input("2. 영상 상황 한 줄 설명")
 
-    if st.button("✨ AI로 제목 2줄 + 훅 + 컷별 자막 자동 작성", use_container_width=True) and s_desc:
-        l_rule = "일본어 작성, 끝은 '~って…'" if "일본어" in s_lang else "한국어, 연결형(~하고/~했는데), 속마음 (괄호), 강조 *별표*, 끝은 '~다고 ..'"
-        sp = f'카테고리형 숏폼 대본 JSON 작성. 주제:{s_desc}. 규칙:{l_rule}. 형식:{{"title1":"","title2":"","hook":"","subs":"0.0|2.0|첫 자막 *강조*\\n2.0|4.0|(속마음)\\n4.0|6.0|마지막 ~다고 .."}}'
-        jd = json.loads(re.sub(r"^```json\s*|\s*```$", "", call_ai(writer_ai, sp, fast=True).strip(), flags=re.M).strip())
-        st.session_state.update({"sh_t1": jd.get("title1",""), "sh_t2": jd.get("title2",""), "sh_hk": jd.get("hook",""), "sh_sb": jd.get("subs","")})
+    if up_vid is not None:
+        st.session_state["sh_raw_vid"] = up_vid.getvalue()
 
+    if "sh_rows" not in st.session_state:
+        st.session_state["sh_rows"] = [
+            {"시작(초)": 0.0, "끝(초)": 2.2, "자막(*초록강조* / (속마음))": "처음엔 가만히 보고 있었는데"},
+            {"시작(초)": 2.2, "끝(초)": 4.5, "자막(*초록강조* / (속마음))": "(설마 진짜 할까 싶더니)"},
+            {"시작(초)": 4.5, "끝(초)": 7.0, "자막(*초록강조* / (속마음))": "갑자기 *엄청난 속도* 로 성공하더니"},
+            {"시작(초)": 7.0, "끝(초)": 9.5, "자막(*초록강조* / (속마음))": "결국 레전드를 찍었다고 .."},
+        ]
+
+    s_desc = st.text_input("2. AI 초안 자동 생성용 상황 설명 (선택 사항 — 아래 표에서 직접 수정 가능)")
+    if st.button("✨ AI로 제목·훅·자막 초안 채우기", use_container_width=True) and s_desc:
+        try:
+            l_rule = "일본어 작성, 끝은 '~って…'" if "일본어" in s_lang else "한국어, 연결형(~하고/~했는데), 속마음 (괄호), 강조 *별표*, 끝은 '~다고 ..'"
+            sp = f'카테고리형 숏폼 대본 JSON. 주제:{s_desc}. 규칙:{l_rule}. 형식:{{"title1":"","title2":"","hook":"","subs":[{{"start":0.0,"end":2.2,"text":""}}]}}'
+            raw_s = call_ai(writer_ai, sp, fast=True).strip()
+            jd = json.loads(re.sub(r"^```json\s*|\s*```$", "", raw_s, flags=re.M).strip())
+            st.session_state["sh_t1"] = jd.get("title1", "")
+            st.session_state["sh_t2"] = jd.get("title2", "")
+            st.session_state["sh_hk"] = jd.get("hook", "")
+            if jd.get("subs"):
+                st.session_state["sh_rows"] = [
+                    {"시작(초)": float(x["start"]), "끝(초)": float(x["end"]), "자막(*초록강조* / (속마음))": x["text"]}
+                    for x in jd["subs"]
+                ]
+            st.rerun()
+        except Exception as e:
+            st.warning(f"AI 서버 혼잡으로 자동 생성을 건너뜁니다. 아래 표에서 직접 입력해 주세요: {e}")
+
+    st.divider()
+    st.markdown("### 🎛️ 3. 제목 · 훅 음성 · 컷별 자막 직접 편집")
     ct1, ct2 = st.columns(2)
-    t_l1 = ct1.text_input("상단 제목 1줄", value=st.session_state.get("sh_t1", "아니 이게 진짜 된다고?"))
-    t_l2 = ct2.text_input("상단 제목 2줄", value=st.session_state.get("sh_t2", "결말까지 보면 무조건 놀람"))
-    hk_txt = st.text_input("첫 문장 훅 음성 (+50% 배속)", value=st.session_state.get("sh_hk", "처음엔 평범해 보였는데"))
-    def_sb = "0.0|2.2|처음엔 가만히 보고 있었는데\n2.2|4.5|(설마 진짜 할까 싶더니)\n4.5|7.0|갑자기 *엄청난 속도* 로 성공하더니\n7.0|9.5|결국 레전드를 찍었다고 .."
-    sb_raw = st.text_area("컷별 자막 (시작초|끝초|자막)", value=st.session_state.get("sh_sb", def_sb), height=110)
+    t_l1 = ct1.text_input("상단 제목 1줄 (흰색)", value=st.session_state.get("sh_t1", "아니 이게 진짜 된다고?"))
+    t_l2 = ct2.text_input("상단 제목 2줄 (노란 강조)", value=st.session_state.get("sh_t2", "결말까지 보면 무조건 놀람"))
+
+    hk_c1, hk_c2 = st.columns([3, 1])
+    hk_txt = hk_c1.text_input("첫 문장 훅 음성 (첫 자막 구간에만 재생)", value=st.session_state.get("sh_hk", "처음엔 평범해 보였는데"))
+    hk_rate = hk_c2.selectbox("훅 음성 속도", ["+50%", "+35%", "+20%", "+0%"], index=0)
+
+    edited_rows = st.data_editor(
+        st.session_state["sh_rows"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "시작(초)": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f"),
+            "끝(초)": st.column_config.NumberColumn(min_value=0.1, step=0.1, format="%.1f"),
+            "자막(*초록강조* / (속마음))": st.column_config.TextColumn(width="large"),
+        }
+    )
+
+    with st.expander("🎨 4. 영상 구도(배율·Y위치) & 글자 크기·볼륨 미세 조정", expanded=True):
+        g1, g2, g3 = st.columns(3)
+        vid_zoom = g1.slider("영상 확대 배율", 0.8, 1.8, 1.0, 0.05)
+        vid_y_off = g2.slider("영상 상하(Y) 위치 이동 (px)", -200, 200, 0, 10)
+        duck_vol = g3.slider("훅 구간 원본 소리 크기 (%)", 0, 100, 20, 5) / 100.0
+
+        f1, f2, f3 = st.columns(3)
+        title_sz = f1.slider("상단 제목 글자 크기", 26, 52, 38, 2)
+        sub_sz = f2.slider("하단 자막 글자 크기", 20, 44, 28, 2)
+        sub_y_pos = f3.slider("하단 자막 높이 (바닥 여백 px)", 80, 320, 175, 5)
 
     p_subs = []
-    for ln in sb_raw.strip().splitlines():
-        ps = [p.strip() for p in ln.split("|")]
-        if len(ps) >= 3:
-            try: p_subs.append({"start": float(ps[0]), "end": float(ps[1]), "text": ps[2]})
-            except ValueError: pass
+    for r in edited_rows:
+        txt_v = str(r.get("자막(*초록강조* / (속마음))") or "").strip()
+        if txt_v:
+            p_subs.append({"start": float(r["시작(초)"]), "end": float(r["끝(초)"]), "text": txt_v})
 
     v_code = "ja-JP-NanamiNeural" if "일본어" in s_lang else "ko-KR-InJoonNeural"
-    p_json = {"resolution": [608, 1080], "fps": 30, "top_bar_px": 280, "voice": v_code, "title": [t_l1, t_l2], "hook_text": hk_txt, "subtitles": p_subs}
-    bc1, bc2 = st.columns(2)
-    fn_j = "project_ja.json" if "일본어" in s_lang else "project_ko.json"
-    bc1.download_button(f"📄 {fn_j} 다운로드", json.dumps(p_json, ensure_ascii=False, indent=2), fn_j, "application/json", use_container_width=True)
+    p_json = {
+        "resolution": [608, 1080], "fps": 30, "top_bar_px": 280,
+        "voice": v_code, "voice_rate": hk_rate,
+        "title": [t_l1, t_l2], "hook_text": hk_txt,
+        "zoom": vid_zoom, "y_offset": vid_y_off, "ducking": duck_vol,
+        "subtitles": p_subs
+    }
 
-    if bc2.button("🎬 608×1080 MP4 렌더링", type="primary", disabled=(up_vid is None), use_container_width=True):
-        with st.spinner("렌더링 중..."):
+    has_vid = "sh_raw_vid" in st.session_state
+    btn_render = st.button(
+        "🎬 현재 설정으로 608×1080 MP4 생성 / 수정 반영 재렌더링",
+        type="primary", disabled=(not has_vid), use_container_width=True
+    )
+
+    if btn_render and has_vid:
+        with st.spinner("수정된 자막·구도·배율을 반영해 MP4를 렌더링 중입니다..."):
             W, H, TH, tmps = 608, 1080, 280, []
             try:
-                vt = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4"); vt.write(up_vid.read()); vt.close(); tmps.append(vt.name)
-                ht = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3"); ht.close(); tmps.append(ht.name)
-                asyncio.run(edge_tts.Communicate(p_json["hook_text"], v_code, rate="+50%").save(ht.name))
+                vt = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                vt.write(st.session_state["sh_raw_vid"]); vt.close(); tmps.append(vt.name)
+                ht = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                ht.close(); tmps.append(ht.name)
+
+                asyncio.run(edge_tts.Communicate(hk_txt, v_code, rate=hk_rate).save(ht.name))
                 hac = AudioFileClip(ht.name); h_dur = hac.duration
-                if p_subs and h_dur > p_subs[0]["end"]: p_subs[0]["end"] = round(h_dur + 0.2, 2)
+                if p_subs and h_dur > p_subs[0]["end"]:
+                    p_subs[0]["end"] = round(h_dur + 0.2, 2)
+
                 sc = VideoFileClip(vt.name)
                 tdur = min(sc.duration, max([s["end"] for s in p_subs], default=10.0))
                 sc = sc.subclip(0, tdur)
-                fp = get_font(); ft, fs = ImageFont.truetype(fp, 38), ImageFont.truetype(fp, 28)
+                fp = get_font()
+                ft, fs = ImageFont.truetype(fp, title_sz), ImageFont.truetype(fp, sub_sz)
 
                 def m_frame(t):
                     im = Image.fromarray(sc.get_frame(t)).convert("RGB")
                     sw, sh = im.size; VH = H - TH
-                    scl = max(W / sw, VH / sh); nw, nh = int(sw * scl), int(sh * scl)
-                    cr = im.resize((nw, nh)).crop(((nw - W)//2, (nh - VH)//2, (nw + W)//2, (nh + VH)//2))
-                    cv = Image.new("RGB", (W, H), (0, 0, 0)); cv.paste(cr, (0, TH))
+                    scl = max(W / sw, VH / sh) * vid_zoom
+                    nw, nh = int(sw * scl), int(sh * scl)
+                    resized = im.resize((nw, nh), Image.Resampling.BILINEAR)
+                    x0 = max(0, (nw - W) // 2)
+                    y0 = max(0, min(nh - VH, (nh - VH) // 2 - vid_y_off))
+                    cr = resized.crop((x0, y0, min(nw, x0 + W), min(nh, y0 + VH))).resize((W, VH))
+
+                    cv = Image.new("RGB", (W, H), (0, 0, 0))
+                    cv.paste(cr, (0, TH))
                     dr = ImageDraw.Draw(cv)
+
                     for i, tl in enumerate(p_json["title"][:2]):
                         tw = dr.textbbox((0, 0), tl, font=ft)[2]
-                        dr.text(((W - tw)//2, 65 + i * 65), tl, font=ft, fill=(255, 230, 0) if i else (255, 255, 255))
+                        ty = 65 + i * (title_sz + 24)
+                        dr.text(((W - tw) // 2, ty), tl, font=ft, fill=(255, 230, 0) if i else (255, 255, 255))
+
                     act = next((s["text"] for s in p_subs if s["start"] <= t < s["end"]), None)
                     if act:
                         tw = dr.textbbox((0, 0), act.replace("*", ""), font=fs)[2]
-                        cx, sy = (W - tw)//2, H - 175
-                        dr.rounded_rectangle([cx - 16, sy - 10, cx + tw + 16, sy + 42], radius=10, fill=(0, 0, 0, 190))
+                        cx, sy = (W - tw) // 2, H - sub_y_pos
+                        dr.rounded_rectangle([cx - 16, sy - 10, cx + tw + 16, sy + sub_sz + 14], radius=10, fill=(0, 0, 0, 190))
                         for seg in re.split(r"(\*[^*]+\*)", act):
                             if not seg: continue
                             gr = seg.startswith("*") and seg.endswith("*")
@@ -275,19 +361,55 @@ with tab_shorts:
                 oc = VideoClip(m_frame, duration=tdur)
                 if sc.audio:
                     p1 = min(h_dur, tdur)
-                    al = [sc.audio.subclip(0, p1).volumex(0.2), hac.set_start(0)]
-                    if tdur > p1: al.append(sc.audio.subclip(p1, tdur).volumex(1.0).set_start(p1))
+                    al = [sc.audio.subclip(0, p1).volumex(duck_vol), hac.set_start(0)]
+                    if tdur > p1:
+                        al.append(sc.audio.subclip(p1, tdur).volumex(1.0).set_start(p1))
                     fa = CompositeAudioClip(al)
-                else: fa = CompositeAudioClip([hac.set_start(0)])
+                else:
+                    fa = CompositeAudioClip([hac.set_start(0)])
+
                 oc = oc.set_audio(fa.set_duration(tdur))
                 ot = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4"); ot.close()
                 oc.write_videofile(ot.name, fps=30, codec="libx264", audio_codec="aac", preset="ultrafast", logger=None)
                 oc.close(); sc.close(); hac.close()
-                st.session_state.shorts_mp4 = open(ot.name, "rb").read(); os.remove(ot.name)
+
+                st.session_state.shorts_mp4 = open(ot.name, "rb").read()
+                st.session_state.shorts_hook_aud = open(ht.name, "rb").read()
+                os.remove(ot.name)
             finally:
                 for f in tmps:
                     if os.path.exists(f): os.remove(f)
 
     if st.session_state.shorts_mp4:
-        st.video(st.session_state.shorts_mp4)
-        st.download_button("📥 완성된 숏폼 MP4 다운로드", st.session_state.shorts_mp4, "category_shorts.mp4", "video/mp4", use_container_width=True)
+        st.divider()
+        st.markdown("### 📺 완성 영상 미리보기 (마음에 안 들면 위 표·슬라이더 수정 후 재렌더링 클릭)")
+        pv1, pv2 = st.columns([1, 1])
+        with pv1:
+            st.video(st.session_state.shorts_mp4)
+        with pv2:
+            st.info("💡 **즉시 수정 가이드**\n- 피사체가 잘렸다면 **4번 구도 패널**에서 `영상 확대 배율`이나 `상하(Y) 위치`를 조절하세요.\n- 자막 타이밍이나 강조 색(`*단어*`)을 바꾸려면 **3번 자막 표**를 고친 뒤 위의 **[재렌더링]** 버튼을 다시 누르면 원본 재업로드 없이 바로 새 영상이 만들어집니다.")
+            st.download_button(
+                "📥 완성된 숏폼 MP4 다운로드",
+                st.session_state.shorts_mp4, "category_shorts.mp4",
+                "video/mp4", type="primary", use_container_width=True
+            )
+            # 2차 외부 편집기(캡컷/프리미어)용 SRT + 훅음성 + JSON ZIP 패키지
+            srt_lines = []
+            for idx, s in enumerate(p_subs, 1):
+                def fmt_t(sec):
+                    h, r = divmod(sec, 3600); m, s_v = divmod(r, 60)
+                    return f"{int(h):02d}:{int(m):02d}:{int(s_v):02d},{int((s_v%1)*1000):03d}"
+                srt_lines.append(f"{idx}\n{fmt_t(s['start'])} --> {fmt_t(s['end'])}\n{s['text'].replace('*','')}\n")
+            sz_buf = io.BytesIO()
+            with zipfile.ZipFile(sz_buf, "w") as zf:
+                zf.writestr("category_shorts.mp4", st.session_state.shorts_mp4)
+                zf.writestr("subtitles.srt", "\n".join(srt_lines))
+                zf.writestr("project.json", json.dumps(p_json, ensure_ascii=False, indent=2))
+                if "shorts_hook_aud" in st.session_state:
+                    zf.writestr("hook_voice.mp3", st.session_state["shorts_hook_aud"])
+            st.download_button(
+                "📦 캡컷/프리미어 2차 편집용 소스 ZIP (MP4+SRT+훅음성+JSON)",
+                sz_buf.getvalue(), "shorts_edit_package.zip",
+                "application/zip", use_container_width=True
+            )
+
